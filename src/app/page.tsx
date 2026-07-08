@@ -1,8 +1,12 @@
 import { createClient } from "@supabase/supabase-js";
-import { mockRaces } from "@/lib/mock-data";
 import type { RaceDay } from "@/lib/scrape/jra-calendar";
+import { FEATURE_RACES, SAMPLE_RESULTS, type FeatureRace } from "@/lib/racing-data";
+import { Hero } from "@/components/Hero";
+import { ScheduleResults, type ScheduleDay } from "@/components/ScheduleResults";
 
 export const dynamic = "force-dynamic";
+
+const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
 
 // Supabase が未設定・無効でも画面が落ちないよう、クライアント生成ごと try/catch で包む。
 async function getUpcomingRaceDays(): Promise<RaceDay[]> {
@@ -25,14 +29,8 @@ async function getUpcomingRaceDays(): Promise<RaceDay[]> {
   }
 }
 
-function trackLabel(rd: RaceDay): string {
-  const kai = rd.kai ? `${rd.kai}回` : "";
-  const nichi = rd.nichi ? `${rd.nichi}日` : "";
-  return `${kai}${rd.track}${nichi}`;
-}
-
-export default async function Home() {
-  const raceDays = await getUpcomingRaceDays();
+// race_days(1日=複数競馬場)を、UI用の日付単位カードデータに畳み込む。
+function toScheduleDays(raceDays: RaceDay[]): ScheduleDay[] {
   const byDate = new Map<string, RaceDay[]>();
   for (const rd of raceDays) {
     const list = byDate.get(rd.date) ?? [];
@@ -40,137 +38,75 @@ export default async function Home() {
     byDate.set(rd.date, list);
   }
 
+  return [...byDate.entries()].map(([date, list]) => {
+    const d = new Date(`${date}T00:00:00+09:00`);
+    return {
+      date,
+      dayLabel: `${d.getMonth() + 1}/${d.getDate()}`,
+      weekday: WEEKDAYS[d.getDay()],
+      tracks: list.map((rd) => ({
+        name: rd.track,
+        kai: rd.kai ? `${rd.kai}回` : "",
+        nichime: rd.nichi ? `${rd.nichi}日目` : "",
+      })),
+      // race_days に grade が無いため、当面 FEATURE_RACES と突き合わせて重賞バッジを付与
+      gradeRaces: FEATURE_RACES.filter((f) => f.date === date).map((f) => ({
+        name: f.name,
+        grade: f.grade,
+        track: f.track,
+      })),
+    };
+  });
+}
+
+// 直近の未来の重賞をヒーロー用に選ぶ
+function pickFeatured(): FeatureRace | null {
+  const today = new Date().toISOString().slice(0, 10);
+  const upcoming = FEATURE_RACES.filter((f) => f.date >= today).sort((a, b) =>
+    a.date.localeCompare(b.date),
+  );
+  return upcoming[0] ?? null;
+}
+
+export default async function Home() {
+  const raceDays = await getUpcomingRaceDays();
+  const days = toScheduleDays(raceDays);
+  const featured = pickFeatured();
+
   return (
-    <div className="min-h-screen bg-gradient-to-b from-emerald-50 to-zinc-50 py-10 px-4 font-sans dark:from-emerald-950/30 dark:to-black">
-      <main className="mx-auto flex max-w-3xl flex-col gap-8">
-        <header className="flex items-center gap-3 rounded-xl bg-gradient-to-r from-emerald-800 to-emerald-700 px-5 py-4 shadow-sm">
-          <span className="text-3xl">🏇</span>
-          <div>
-            <h1 className="text-xl font-bold text-white">
-              競馬予想アプリ
-            </h1>
-            <p className="text-xs text-emerald-100">
-              レース一覧（ダミーデータ）
-            </p>
-          </div>
-        </header>
-
-        <section className="overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
-          <div className="flex items-center gap-2 border-b-2 border-amber-400 bg-zinc-50 px-5 py-3 dark:bg-zinc-900/60">
-            <span className="text-2xl">📅</span>
-            <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-50">
-              今後の開催日程
-            </h2>
-          </div>
-
-          {byDate.size === 0 ? (
-            <p className="px-5 py-6 text-sm text-zinc-500 dark:text-zinc-400">
-              日程データがまだありません
-            </p>
-          ) : (
-            <ul>
-              {[...byDate.entries()].map(([date, list]) => (
-                <li
-                  key={date}
-                  className="flex flex-col gap-1 border-b border-zinc-100 px-5 py-3 last:border-0 sm:flex-row sm:items-center sm:gap-4 dark:border-zinc-800"
-                >
-                  <span className="w-28 shrink-0 text-sm font-medium text-zinc-900 dark:text-zinc-50">
-                    {date}
-                  </span>
-                  <span className="flex flex-wrap gap-2">
-                    {list.map((rd) => (
-                      <span
-                        key={rd.track}
-                        className="w-fit rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200"
-                      >
-                        {trackLabel(rd)}
-                      </span>
-                    ))}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
-
-        {mockRaces.map((race) => (
-          <section
-            key={race.id}
-            className="overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm dark:border-zinc-800 dark:bg-zinc-900"
+    <div className="paper-bg min-h-screen">
+      <header style={{ background: "var(--turf-deep)" }}>
+        <div className="mx-auto flex max-w-5xl items-center gap-3 px-5 py-4 sm:px-8">
+          <span className="text-2xl">🏇</span>
+          <span
+            className="font-display text-2xl font-bold tracking-wide italic"
+            style={{ color: "var(--gold-bright)" }}
           >
-            <div className="flex items-center justify-between gap-2 border-b-2 border-amber-400 bg-zinc-50 px-5 py-3 dark:bg-zinc-900/60">
-              <div>
-                <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-50">
-                  {race.name}
-                </h2>
-                <p className="text-sm text-zinc-500 dark:text-zinc-400">
-                  {race.venue} / {race.date}
-                </p>
-              </div>
-              <span className="text-2xl">🏆</span>
-            </div>
+            KEIBA YOSOU
+          </span>
+          <span className="text-xs font-bold tracking-[0.3em]" style={{ color: "#d9d2bd" }}>
+            競馬予想
+          </span>
+          <span className="ml-auto text-xs" style={{ color: "#b9b19a" }}>
+            データ出典:JRA公式
+          </span>
+        </div>
+      </header>
+      <div className="checker-strip" />
 
-            <table className="w-full text-left text-sm">
-              <thead>
-                <tr className="border-b border-zinc-200 text-zinc-500 dark:border-zinc-800 dark:text-zinc-400">
-                  <th className="py-2 pr-2 pl-5 font-medium">馬番</th>
-                  <th className="py-2 pr-2 font-medium">馬名</th>
-                  <th className="py-2 pr-2 font-medium">オッズ</th>
-                  <th className="py-2 pr-2 font-medium">人気</th>
-                  <th className="py-2 pr-5 font-medium">予想</th>
-                </tr>
-              </thead>
-              <tbody>
-                {race.horses.map((horse) => (
-                  <tr
-                    key={horse.number}
-                    className="border-b border-zinc-100 last:border-0 dark:border-zinc-800"
-                  >
-                    <td className="py-2 pr-2 pl-5 text-zinc-700 dark:text-zinc-300">
-                      {horse.number}
-                    </td>
-                    <td className="py-2 pr-2 font-medium text-zinc-900 dark:text-zinc-50">
-                      {horse.name}
-                    </td>
-                    <td className="py-2 pr-2 text-zinc-700 dark:text-zinc-300">
-                      {horse.odds.toFixed(1)}
-                    </td>
-                    <td className="py-2 pr-2 text-zinc-700 dark:text-zinc-300">
-                      {horse.popularity}
-                    </td>
-                    <td className="py-2 pr-5">
-                      {horse.popularity === 1 && (
-                        <div className="flex flex-col gap-0.5">
-                          <span className="w-fit rounded-full bg-red-100 px-2 py-0.5 text-xs font-semibold text-red-700 dark:bg-red-900/40 dark:text-red-300">
-                            予想◎
-                          </span>
-                          {horse.reason && (
-                            <span className="text-xs text-zinc-500 dark:text-zinc-400">
-                              {horse.reason}
-                            </span>
-                          )}
-                        </div>
-                      )}
-                      {horse.popularity === 2 && (
-                        <div className="flex flex-col gap-0.5">
-                          <span className="w-fit rounded-full bg-blue-100 px-2 py-0.5 text-xs font-semibold text-blue-700 dark:bg-blue-900/40 dark:text-blue-300">
-                            予想◯
-                          </span>
-                          {horse.reason && (
-                            <span className="text-xs text-zinc-500 dark:text-zinc-400">
-                              {horse.reason}
-                            </span>
-                          )}
-                        </div>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </section>
-        ))}
+      <Hero featured={featured} />
+      <div className="checker-strip" />
+
+      <main className="mx-auto max-w-5xl px-5 py-10 sm:px-8">
+        <ScheduleResults days={days} results={SAMPLE_RESULTS} />
       </main>
+
+      <footer style={{ background: "var(--turf-deep)" }}>
+        <div className="mx-auto max-w-5xl px-5 py-5 text-xs sm:px-8" style={{ color: "#b9b19a" }}>
+          keiba-yosou-app — 個人開発 / データは JRA
+          公式サイトより最小頻度で取得・キャッシュしています
+        </div>
+      </footer>
     </div>
   );
 }
