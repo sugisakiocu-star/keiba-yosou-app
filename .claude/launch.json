@@ -5,7 +5,9 @@
       "name": "keiba-yosou-app-dev",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev"],
-      "port": 3000
+      "cwd": "/Users/sugisakikouta/Desktop/konkon/30_Projects/keiba-yosou-app",
+      "port": 3000,
+      "autoPort": true
     }
   ]
 }
