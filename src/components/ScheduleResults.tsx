@@ -123,12 +123,14 @@ function ResultCard({ r }: { r: RaceResult }) {
         </tbody>
       </table>
       <div className="flex gap-4 px-4 py-2 text-xs" style={{ background: "var(--paper-dark)" }}>
-        <span>
-          単勝{" "}
-          <b className="font-display text-sm" style={{ color: "var(--turf)" }}>
-            {r.payoutWin}
-          </b>
-        </span>
+        {r.payoutWin && (
+          <span>
+            単勝{" "}
+            <b className="font-display text-sm" style={{ color: "var(--turf)" }}>
+              {r.payoutWin}
+            </b>
+          </span>
+        )}
         <span className="ml-auto" style={{ color: "var(--ink-soft)" }}>
           {r.date}
         </span>
@@ -137,16 +139,34 @@ function ResultCard({ r }: { r: RaceResult }) {
   );
 }
 
-function ResultsSection({ results }: { results: RaceResult[] }) {
+function ResultsSection({
+  results,
+  isSample,
+}: {
+  results: RaceResult[];
+  isSample: boolean;
+}) {
+  if (results.length === 0) {
+    return (
+      <p className="rounded border border-[var(--turf)] bg-white/70 px-5 py-6 text-sm text-[var(--ink-soft)]">
+        結果データがまだありません
+      </p>
+    );
+  }
   return (
     <div className="space-y-4">
       {results.map((r) => (
         <ResultCard key={r.id} r={r} />
       ))}
-      <p className="text-xs" style={{ color: "var(--ink-soft)" }}>
-        ※ 馬名・結果はデザイン確認用のサンプルです。フェーズ3(結果取得パイプライン)実装後に JRA
-        公式の実データへ差し替わります。
-      </p>
+      {isSample ? (
+        <p className="text-xs" style={{ color: "var(--ink-soft)" }}>
+          ※ 馬名・結果はデザイン確認用のサンプルです。結果データ取得後に JRA 公式の実データへ差し替わります。
+        </p>
+      ) : (
+        <p className="text-xs" style={{ color: "var(--ink-soft)" }}>
+          ※ 直近の重賞レース結果。データ出典:JRA公式。単勝払戻は今後の対応で追加予定です。
+        </p>
+      )}
     </div>
   );
 }
@@ -154,9 +174,11 @@ function ResultsSection({ results }: { results: RaceResult[] }) {
 export function ScheduleResults({
   days,
   results,
+  resultsAreSample = false,
 }: {
   days: ScheduleDay[];
   results: RaceResult[];
+  resultsAreSample?: boolean;
 }) {
   const [tab, setTab] = useState<"schedule" | "results">("schedule");
 
@@ -187,7 +209,7 @@ export function ScheduleResults({
       {tab === "schedule" ? (
         <ScheduleSection days={days} />
       ) : (
-        <ResultsSection results={results} />
+        <ResultsSection results={results} isSample={resultsAreSample} />
       )}
     </>
   );

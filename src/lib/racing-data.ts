@@ -77,7 +77,7 @@ export interface RaceResult {
   going: string; // 馬場状態
   time: string;
   top3: ResultHorse[];
-  payoutWin: string; // 単勝払戻
+  payoutWin?: string; // 単勝払戻(結果クロールでは未取得。将来対応)
 }
 
 // 先週の結果(サンプル)。実装ではフェーズ3の結果テーブルから取得する。
