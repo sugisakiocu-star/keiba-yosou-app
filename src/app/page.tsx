@@ -1,6 +1,45 @@
+import { createClient } from "@supabase/supabase-js";
 import { mockRaces } from "@/lib/mock-data";
+import type { RaceDay } from "@/lib/scrape/jra-calendar";
 
-export default function Home() {
+export const dynamic = "force-dynamic";
+
+// Supabase が未設定・無効でも画面が落ちないよう、クライアント生成ごと try/catch で包む。
+async function getUpcomingRaceDays(): Promise<RaceDay[]> {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  if (!url?.startsWith("http") || !anonKey) return [];
+
+  const today = new Date().toISOString().slice(0, 10);
+  try {
+    const supabase = createClient(url, anonKey);
+    const { data, error } = await supabase
+      .from("race_days")
+      .select("date, track, kai, nichi")
+      .gte("date", today)
+      .order("date", { ascending: true });
+    if (error) return [];
+    return data ?? [];
+  } catch {
+    return [];
+  }
+}
+
+function trackLabel(rd: RaceDay): string {
+  const kai = rd.kai ? `${rd.kai}回` : "";
+  const nichi = rd.nichi ? `${rd.nichi}日` : "";
+  return `${kai}${rd.track}${nichi}`;
+}
+
+export default async function Home() {
+  const raceDays = await getUpcomingRaceDays();
+  const byDate = new Map<string, RaceDay[]>();
+  for (const rd of raceDays) {
+    const list = byDate.get(rd.date) ?? [];
+    list.push(rd);
+    byDate.set(rd.date, list);
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-b from-emerald-50 to-zinc-50 py-10 px-4 font-sans dark:from-emerald-950/30 dark:to-black">
       <main className="mx-auto flex max-w-3xl flex-col gap-8">
@@ -15,6 +54,44 @@ export default function Home() {
             </p>
           </div>
         </header>
+
+        <section className="overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+          <div className="flex items-center gap-2 border-b-2 border-amber-400 bg-zinc-50 px-5 py-3 dark:bg-zinc-900/60">
+            <span className="text-2xl">📅</span>
+            <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-50">
+              今後の開催日程
+            </h2>
+          </div>
+
+          {byDate.size === 0 ? (
+            <p className="px-5 py-6 text-sm text-zinc-500 dark:text-zinc-400">
+              日程データがまだありません
+            </p>
+          ) : (
+            <ul>
+              {[...byDate.entries()].map(([date, list]) => (
+                <li
+                  key={date}
+                  className="flex flex-col gap-1 border-b border-zinc-100 px-5 py-3 last:border-0 sm:flex-row sm:items-center sm:gap-4 dark:border-zinc-800"
+                >
+                  <span className="w-28 shrink-0 text-sm font-medium text-zinc-900 dark:text-zinc-50">
+                    {date}
+                  </span>
+                  <span className="flex flex-wrap gap-2">
+                    {list.map((rd) => (
+                      <span
+                        key={rd.track}
+                        className="w-fit rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200"
+                      >
+                        {trackLabel(rd)}
+                      </span>
+                    ))}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
 
         {mockRaces.map((race) => (
           <section
