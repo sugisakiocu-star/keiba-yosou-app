@@ -3,6 +3,7 @@
 import { useState } from "react";
 import type { RaceResult, RaceCard, Grade } from "@/lib/racing-data";
 import { WAKU_COLORS } from "@/lib/racing-data";
+import type { RacePrediction } from "@/lib/predict";
 import { GradeBadge, Umaban } from "@/components/racing-bits";
 
 export interface ScheduleDay {
@@ -245,6 +246,104 @@ function EntriesSection({ raceCards }: { raceCards: RaceCard[] }) {
   );
 }
 
+function PredictionCard({ p }: { p: RacePrediction }) {
+  return (
+    <div
+      className="result-card border bg-white/70"
+      style={{ borderColor: "var(--turf)", borderWidth: 1.5 }}
+    >
+      <div
+        className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-2.5"
+        style={{ borderColor: "var(--paper-dark)" }}
+      >
+        {p.grade && <GradeBadge grade={p.grade} />}
+        <span className="font-display text-lg font-bold">{p.raceName}</span>
+        <span className="text-xs font-bold" style={{ color: "var(--ink-soft)" }}>
+          {p.dayLabel} {p.track}
+          {p.raceNo}R
+        </span>
+        <span className="ml-auto text-xs" style={{ color: "var(--ink-soft)" }}>
+          簡易スコア順
+        </span>
+      </div>
+      <table className="w-full text-sm">
+        <tbody>
+          {p.horses.map((h) => (
+            <tr
+              key={h.name}
+              className="border-b last:border-b-0"
+              style={{ borderColor: "var(--paper-dark)" }}
+            >
+              <td
+                className="font-display w-10 py-2 pl-4 text-center text-lg font-bold"
+                style={{ color: h.mark === "◎" ? "var(--gold)" : "var(--ink)" }}
+              >
+                {h.mark ?? ""}
+              </td>
+              <td className="py-2">
+                <div className="font-bold">{h.name}</div>
+                <div className="mt-1 flex items-center gap-2">
+                  <div
+                    className="h-1.5 overflow-hidden rounded-full"
+                    style={{ background: "var(--paper-dark)", width: 120 }}
+                  >
+                    <div
+                      className="h-full rounded-full"
+                      style={{ background: "var(--turf)", width: `${h.barPct}%` }}
+                    />
+                  </div>
+                  <span className="font-display text-xs" style={{ color: "var(--turf)" }}>
+                    {h.total.toFixed(1)}
+                  </span>
+                </div>
+              </td>
+              <td
+                className="hidden max-w-40 pr-2 text-right text-xs sm:table-cell"
+                style={{ color: "var(--ink-soft)" }}
+              >
+                {h.runsLabel}
+              </td>
+              <td className="w-40 pr-4 text-right text-xs" style={{ color: "var(--ink-soft)" }}>
+                <div>{h.jockey}</div>
+                <div>
+                  {h.jockeyRate != null ? `重賞複勝率${Math.round(h.jockeyRate * 100)}%` : "騎手データ少"}
+                  {h.weightCarry != null ? ` / ${h.weightCarry.toFixed(1)}kg` : ""}
+                </div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div
+        className="px-4 py-2 text-xs"
+        style={{ background: "var(--paper-dark)", color: "var(--ink-soft)" }}
+      >
+        スコア = 過去1年の重賞実績(グレード・直近・中距離適性で重み付け)+ 騎手の重賞複勝率 + 斤量差
+      </div>
+    </div>
+  );
+}
+
+function PredictionsSection({ predictions }: { predictions: RacePrediction[] }) {
+  if (predictions.length === 0) {
+    return (
+      <p className="rounded border border-[var(--turf)] bg-white/70 px-5 py-6 text-sm text-[var(--ink-soft)]">
+        予想データがまだありません(出馬表の取得後に自動で採点されます)
+      </p>
+    );
+  }
+  return (
+    <div className="space-y-4">
+      {predictions.map((p) => (
+        <PredictionCard key={p.raceId} p={p} />
+      ))}
+      <p className="text-xs" style={{ color: "var(--ink-soft)" }}>
+        ※ 過去1年の重賞結果のみを材料にした簡易スコアです。精度は未検証・的中を保証するものではありません。馬券の購入は自己責任で。
+      </p>
+    </div>
+  );
+}
+
 function ResultsSection({
   results,
   isSample,
@@ -277,10 +376,20 @@ function ResultsSection({
   );
 }
 
-const TAB_HEADINGS: Record<"schedule" | "entries" | "results", [string, string]> = {
+type TabKey = "schedule" | "entries" | "predictions" | "results";
+
+const TAB_HEADINGS: Record<TabKey, [string, string]> = {
   schedule: ["今後の開催日程", "RACE CALENDAR"],
   entries: ["今週の出馬表", "RACE CARD"],
+  predictions: ["今週の予想", "PREDICTIONS"],
   results: ["先週の結果", "LAST WEEK RESULTS"],
+};
+
+const TAB_LABELS: Record<TabKey, string> = {
+  schedule: "開催日程",
+  entries: "出馬表",
+  predictions: "予想",
+  results: "先週の結果",
 };
 
 export function ScheduleResults({
@@ -288,36 +397,29 @@ export function ScheduleResults({
   results,
   resultsAreSample = false,
   raceCards = [],
+  predictions = [],
 }: {
   days: ScheduleDay[];
   results: RaceResult[];
   resultsAreSample?: boolean;
   raceCards?: RaceCard[];
+  predictions?: RacePrediction[];
 }) {
-  const [tab, setTab] = useState<"schedule" | "entries" | "results">("schedule");
+  const [tab, setTab] = useState<TabKey>("schedule");
   const [heading, subheading] = TAB_HEADINGS[tab];
 
   return (
     <>
       <div className="mb-8 flex">
-        <button
-          className={`ticket-tab ${tab === "schedule" ? "active" : ""}`}
-          onClick={() => setTab("schedule")}
-        >
-          開催日程
-        </button>
-        <button
-          className={`ticket-tab ${tab === "entries" ? "active" : ""}`}
-          onClick={() => setTab("entries")}
-        >
-          出馬表
-        </button>
-        <button
-          className={`ticket-tab ${tab === "results" ? "active" : ""}`}
-          onClick={() => setTab("results")}
-        >
-          先週の結果
-        </button>
+        {(Object.keys(TAB_LABELS) as TabKey[]).map((key) => (
+          <button
+            key={key}
+            className={`ticket-tab ${tab === key ? "active" : ""}`}
+            onClick={() => setTab(key)}
+          >
+            {TAB_LABELS[key]}
+          </button>
+        ))}
       </div>
 
       <h2 className="rail-heading font-display mb-6 text-2xl font-bold">
@@ -329,6 +431,7 @@ export function ScheduleResults({
 
       {tab === "schedule" && <ScheduleSection days={days} />}
       {tab === "entries" && <EntriesSection raceCards={raceCards} />}
+      {tab === "predictions" && <PredictionsSection predictions={predictions} />}
       {tab === "results" && <ResultsSection results={results} isSample={resultsAreSample} />}
     </>
   );

@@ -8,6 +8,7 @@ import {
   type RaceCard,
   type Grade,
 } from "@/lib/racing-data";
+import { buildPredictions } from "@/lib/predict";
 import { Hero } from "@/components/Hero";
 import { ScheduleResults, type ScheduleDay } from "@/components/ScheduleResults";
 
@@ -227,6 +228,7 @@ export default async function Home() {
     getRecentResults(),
     getRaceCards(),
   ]);
+  const predictions = await buildPredictions(raceCards);
   const days = toScheduleDays(raceDays);
   const featured = pickFeatured();
 
@@ -264,6 +266,7 @@ export default async function Home() {
           results={results}
           resultsAreSample={resultsAreSample}
           raceCards={raceCards}
+          predictions={predictions}
         />
       </main>
 
