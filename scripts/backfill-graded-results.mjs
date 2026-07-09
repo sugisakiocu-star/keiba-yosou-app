@@ -24,13 +24,15 @@ const KEIBA_TOP = "https://www.jra.go.jp/keiba/";
 const ACCESS_S = "https://www.jra.go.jp/JRADB/accessS.html";
 const CAL_JSON = (ym) => `https://www.jra.go.jp/keiba/common/calendar/json/${ym}.json`;
 const DELAY_MS = 1500;
-const MONTHS_BACK = 12;
 
 // ---- CLI引数 ----
 const args = process.argv.slice(2);
 const DRY = args.includes("--dry");
 const limIdx = args.indexOf("--limit");
 const LIMIT = limIdx >= 0 ? Number(args[limIdx + 1]) : Infinity;
+// 遡る月数。既定12ヶ月。--months N で拡張(例: 3年分は --months 36)。
+const monthsIdx = args.indexOf("--months");
+const MONTHS_BACK = monthsIdx >= 0 ? Number(args[monthsIdx + 1]) : 12;
 const VERBOSE = args.includes("--verbose");
 const SKIP_EXISTING = args.includes("--skip-existing"); // 既にDBにある(date,name)は取得しない
 const DEBUG = args.includes("--debug"); // 一致しないとき候補レース名をダンプ
@@ -369,7 +371,7 @@ async function main() {
   const today = new Date();
   const toDate = today.toISOString().slice(0, 10);
   const fromD = new Date(today);
-  fromD.setFullYear(fromD.getFullYear() - 1);
+  fromD.setMonth(fromD.getMonth() - MONTHS_BACK); // 既定12ヶ月。--months で拡張
   const fromDate = fromD.toISOString().slice(0, 10);
 
   console.log(`■ 重賞結果バックフィル  期間 ${fromDate} 〜 ${toDate}`);
