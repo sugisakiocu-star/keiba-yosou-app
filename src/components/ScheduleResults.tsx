@@ -286,7 +286,7 @@ function EntryCard({ r }: { r: RaceCard }) {
         style={{ background: "var(--paper-dark)", color: "var(--ink-soft)" }}
       >
         {anyPast ? "馬名をタップで直近4走を表示。" : ""}
-        {r.gateConfirmed ? "枠順確定・馬番順" : "枠順は前々日(金)に確定します。現在は50音順・枠/馬番は未定"}
+        {r.gateConfirmed ? "枠順確定・馬番順" : "枠順は開催前日の朝に確定します(土曜開催→金曜, 日曜開催→土曜)。現在は50音順・枠/馬番は未定"}
       </div>
     </div>
   );
