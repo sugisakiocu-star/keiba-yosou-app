@@ -1,20 +1,35 @@
-// 過去1年分の「重賞」レース結果を JRA 公式からクロールして Supabase に保存する一回限りのローカルバッチ。
+// 指定期間の「全レース」(重賞に限らずOP/リステッド/条件戦も含む)結果を JRA 公式から
+// クロールして Supabase に保存するローカルバッチ。scripts/backfill-graded-results.mjs(重賞専用)
+// とは別スクリプトとして新設。既存スクリプトは変更しない。
+//
+// 背景: 予想モデルの近走フォームスコアが、重賞歴の無い条件戦好走馬を過小評価している問題を
+// バックテスト側でも解消するため、重賞以外のレース結果もためる。
 //
 // 使い方(プロジェクト直下で):
-//   node scripts/backfill-graded-results.mjs --dry --limit 3   … DB書き込みせず先頭3件だけ試す
-//   node scripts/backfill-graded-results.mjs --limit 3         … 先頭3件だけ実際に保存
-//   node scripts/backfill-graded-results.mjs                   … 過去12ヶ月の重賞を全件保存
+//   node scripts/backfill-all-results.mjs --dry --from 2026-06-01 --to 2026-06-30
+//     … 2026年6月だけ試し、DB書き込みせず件数/リクエスト数を確認
+//   node scripts/backfill-all-results.mjs --from 2026-06-01 --to 2026-06-30 --skip-existing
+//     … 実際に保存(月単位などチャンクに分けて複数回実行する想定)
+//   node scripts/backfill-all-results.mjs --year 2026 --skip-existing
+//     … 2026-01-01〜今日(未来日は除外)をまとめて対象にする(通常は月ごとに分けて叩くこと)
+//   node scripts/backfill-all-results.mjs
+//     … 期間指定なしなら安全のため既定で直近1ヶ月だけ
 //
 // 設計方針(プロジェクトの取得ルール準拠):
-//   - JRA公式のみ。UA明示。リクエスト間隔を DELAY_MS 空ける(既定1.5秒)。
-//   - 重賞のみに限定してリクエスト数を最小化(年間 ~140レース)。
-//   - 取得元: 「過去レース結果検索」の POST クロール連鎖(accessS.html)。
-//   - どのレースが重賞かは、既に使っている月別カレンダーJSONの gradeRace から判定。
+//   - JRA公式のみ。UA明示。リクエスト間隔を DELAY_MS 空ける(既定1.5秒、重賞版と同じ)。
+//   - 重賞版との違いは「レース列挙をカレンダーJSONの重賞名一致で絞り込まない」ことだけ。
+//     開催日の選択ページ(parseSelection)はもともと全レースを列挙できるので、絞り込みを外すだけでよい。
+//   - 同日に複数場(例: 東京・阪神が同日開催)が開催していれば、その日の dayCnames を全部回り、
+//     それぞれの選択ページから全レースを集める(「1つの場で見つかったら終わり」にしない。
+//     重賞は1日1回という前提が崩れるため matchRace 的な名前一致・breakは行わない)。
+//   - 選択ページのヘッダー(class="opt")に開催場(例:「2026年7月4日（土曜）2回福島3日」)が
+//     載っているため、結果ページを叩く前に track を確定できる。これを使って --skip-existing を
+//     「結果ページを叩く前」に効かせ、無駄なリクエストを減らす。
 //   - JRADB の HTML は Shift_JIS。TextDecoder("shift_jis") で明示デコード。
 //
 // クロール連鎖:
 //   /keiba/ → 過去結果入口 pw01skl00999999 → (月ページ pw01skl10YYYYMM を前月へ辿って開催日リンクを収集)
-//     → 開催日 pw01srl…YYYYMMDD → レース選択(pw01sde…一覧+レース名) → 重賞名に一致する pw01sde → 結果テーブル
+//     → 開催日 pw01srl…YYYYMMDD(=場ごとの選択ページ) → 選択ページの全レース(pw01sde…) → 結果テーブル
 
 import { createClient } from "@supabase/supabase-js";
 
@@ -22,7 +37,6 @@ import { createClient } from "@supabase/supabase-js";
 const UA = "keiba-yosou-app (personal study project)";
 const KEIBA_TOP = "https://www.jra.go.jp/keiba/";
 const ACCESS_S = "https://www.jra.go.jp/JRADB/accessS.html";
-const CAL_JSON = (ym) => `https://www.jra.go.jp/keiba/common/calendar/json/${ym}.json`;
 const DELAY_MS = 1500;
 
 // ---- CLI引数 ----
@@ -30,12 +44,30 @@ const args = process.argv.slice(2);
 const DRY = args.includes("--dry");
 const limIdx = args.indexOf("--limit");
 const LIMIT = limIdx >= 0 ? Number(args[limIdx + 1]) : Infinity;
-// 遡る月数。既定12ヶ月。--months N で拡張(例: 3年分は --months 36)。
-const monthsIdx = args.indexOf("--months");
-const MONTHS_BACK = monthsIdx >= 0 ? Number(args[monthsIdx + 1]) : 12;
 const VERBOSE = args.includes("--verbose");
-const SKIP_EXISTING = args.includes("--skip-existing"); // 既にDBにある(date,name)は取得しない
-const DEBUG = args.includes("--debug"); // 一致しないとき候補レース名をダンプ
+const SKIP_EXISTING = args.includes("--skip-existing");
+
+const fromIdx = args.indexOf("--from");
+const toIdx = args.indexOf("--to");
+const yearIdx = args.indexOf("--year");
+const todayStr = new Date().toISOString().slice(0, 10);
+
+let fromDate, toDate;
+if (yearIdx >= 0) {
+  const y = args[yearIdx + 1];
+  fromDate = `${y}-01-01`;
+  toDate = `${y}-12-31`;
+} else if (fromIdx >= 0 || toIdx >= 0) {
+  fromDate = fromIdx >= 0 ? args[fromIdx + 1] : todayStr;
+  toDate = toIdx >= 0 ? args[toIdx + 1] : todayStr;
+} else {
+  // 期間指定なし: 安全のため既定で直近1ヶ月だけ(明示的に --from/--to/--year を渡さないと広がらない)
+  const d = new Date();
+  d.setMonth(d.getMonth() - 1);
+  fromDate = d.toISOString().slice(0, 10);
+  toDate = todayStr;
+}
+if (toDate > todayStr) toDate = todayStr; // 未来日は結果が無いのでクランプ
 
 // ---- env ----
 try {
@@ -103,68 +135,6 @@ async function post(cname) {
   await sleep(DELAY_MS);
   return html;
 }
-async function getJson(url) {
-  reqCount++;
-  const json = await withRetry(async () => {
-    const res = await fetch(url, { headers: { "User-Agent": UA }, cache: "no-store" });
-    if (!res.ok) throw new Error(`GET(json) ${res.status} ${url}`);
-    return res.json();
-  }, `GET(json) ${url}`);
-  await sleep(DELAY_MS);
-  return json;
-}
-
-// レース名の表記ゆれ吸収(「府中牝馬ステークス」と「府中牝馬S」を一致させる)
-const normName = (s) =>
-  String(s ?? "")
-    .replace(/ステークス/g, "S")
-    .replace(/ハンデキャップ/g, "H")
-    .replace(/ハンデ/g, "H")
-    .replace(/カップ/g, "C")
-    .replace(/[\s　・]/g, "")
-    .trim();
-
-// カッコ内(（秋）等)を除いた版も作る
-const stripParen = (s) => String(s ?? "").replace(/[（(][^)）]*[)）]/g, "");
-
-// カレンダーの通称 → 選択ページ(JRA公式名/略称)に現れる部分文字列。
-// 正規化では吸収できない別名だけをここで橋渡しする。
-const NAME_ALIASES = {
-  オークス: ["優駿牝馬"],
-  日本ダービー: ["東京優駿"],
-  アメリカJCC: ["アメリカジョッキー"],
-  マイルチャンピオンシップ: ["マイルチャンピオン"],
-  阪神ジュベナイルフィリーズ: ["阪神ジュベナイル"],
-  朝日杯フューチュリティS: ["朝日フューチュリティ", "朝日杯フューチュリティ"],
-  弥生賞ディープインパクト記念: ["弥生ディープ", "弥生賞ディープ"],
-  サウジアラビアロイヤルC: ["サウジアラビア"],
-  ダービー卿CT: ["ダービー卿"],
-  阪神スプリングジャンプ: ["阪神スプリングジャンプ", "阪神スプリングJ"],
-  アイビスサマーダッシュ: ["アイビスサマーダッシュ", "アイビス"],
-};
-
-// レース選択ページの一覧から、重賞 g に対応する行を柔軟に照合する。
-// 別名テーブル → 表記ゆれ正規化(ステークス/S・ハンデ/H・カッコ有無・双方向部分一致)の順で試す。
-function matchRace(races, g) {
-  const aliases = NAME_ALIASES[g.name];
-  if (aliases) {
-    const hit = races.find((r) => aliases.some((a) => r.name.includes(a)));
-    if (hit) return hit;
-  }
-  const keys = [
-    normName(g.name),
-    normName(g.detail),
-    normName(stripParen(g.name)),
-    normName(stripParen(g.detail)),
-  ].filter((k) => k.length >= 2);
-  return races.find((r) => {
-    const cand = normName(r.name);
-    const candS = normName(stripParen(r.name));
-    return keys.some(
-      (k) => cand.includes(k) || k.includes(cand) || candS.includes(k) || k.includes(candS),
-    );
-  });
-}
 
 // ---- クロール ----
 
@@ -177,6 +147,7 @@ async function fetchResultsIndexCname() {
 }
 
 // 月ページ/索引ページから開催日リンク(pw01srl…YYYYMMDD/XX)を { date: cname } で取り出す
+// 同日に複数場が開催していれば、場ごとに異なる cname が複数入る。
 function parseDayLinks(html) {
   const re = /pw01srl\d{12}(\d{8})\/[0-9A-F]{2}/g;
   const out = {};
@@ -195,8 +166,9 @@ function findMonthCname(html, ym) {
   return m ? m[0] : null;
 }
 
-// 過去12ヶ月分の開催日リンクマップ { 'YYYY-MM-DD': Set(cname) } を作る
-async function collectDayLinks() {
+// fromDate の月まで、開催日リンクマップ { 'YYYY-MM-DD': Set(cname) } を月ページを遡って集める
+async function collectDayLinks(fromDate) {
+  const fromYm = fromDate.slice(0, 4) + fromDate.slice(5, 7);
   const dayMap = {};
   const merge = (src) => {
     for (const [date, set] of Object.entries(src)) {
@@ -209,7 +181,6 @@ async function collectDayLinks() {
   const indexHtml = await post(indexCname);
   merge(parseDayLinks(indexHtml)); // 索引ページには直近の開催日も載っている
 
-  // 索引が持つ月リンクのうち最新の月から前月へ辿る
   const monthLinks = [...indexHtml.matchAll(/pw01skl10(\d{6})\/[0-9A-F]{2}/g)].map((m) => m[1]);
   let ym = monthLinks.sort().reverse()[0];
   if (!ym) {
@@ -218,10 +189,9 @@ async function collectDayLinks() {
   }
 
   let cname = findMonthCname(indexHtml, ym);
-  for (let i = 0; i < MONTHS_BACK && cname; i++) {
+  while (cname && ym >= fromYm) {
     const html = await post(cname);
     merge(parseDayLinks(html));
-    // 前月を計算して、その月ページ cname をこのページ内のナビから取得
     const y = Number(ym.slice(0, 4));
     const mo = Number(ym.slice(4, 6));
     const prev = mo === 1 ? `${y - 1}12` : `${y}${String(mo - 1).padStart(2, "0")}`;
@@ -232,16 +202,30 @@ async function collectDayLinks() {
 }
 
 // sde コードに埋まっているレース番号を取り出す(権威ソース)。
-// 例 pw01sde 100220260107 01 20260704 /21 → 中央の 2桁 "01" がレース番号
 function raceNoFromSde(sde) {
   const m = String(sde ?? "").match(/pw01sde\d{12}(\d{2})\d{8}\//);
   return m ? Number(m[1]) : null;
 }
 
-// レース選択ページから [{ raceNo, name, sde }] を取り出す
+// 選択ページのヘッダー(class="opt": 例「2026年7月4日（土曜）2回福島3日」)から
+// 開催場を取り出す。結果ページを叩く前に track を確定させ、skip-existing 判定に使う。
+function parseSelectionHeader(html) {
+  const m = html.match(/class="opt">([\s\S]*?)<\/span>/);
+  if (!m) return {};
+  const t = stripTags(m[1]);
+  const meta = {};
+  const km = t.match(/(\d+)回(\D+?)(\d+)日/);
+  if (km) {
+    meta.kai = Number(km[1]);
+    meta.track = km[2].trim();
+    meta.nichi = Number(km[3]);
+  }
+  return meta;
+}
+
+// レース選択ページから [{ raceNo, name, sde }] を取り出す(重賞に限らず全レース)
 function parseSelection(html) {
   const out = [];
-  // 行ごと(race_num セルを起点に)に sde コード・レース番号・レース名を拾う
   const re =
     /class="race_num">[\s\S]*?(pw01sde\d+\/[0-9A-F]{2})[\s\S]*?alt="(\d+)レース"[\s\S]*?class="race_name">([\s\S]*?)<\/td>/g;
   for (const m of html.matchAll(re)) {
@@ -273,11 +257,10 @@ function parseResult(html) {
 
   const course = html.match(/class="cell course"[\s\S]*?コース：<\/span>\s*([\d,]+)\s*<span class="unit">メートル<\/span>\s*<span class="detail">（([^）]+)）/);
   if (course) {
-    meta.distance = toInt(course[1].replace(/,/g, "")); // "2,000" → 2000
-    meta.surface = course[2].split(/[・\/]/)[0].trim(); // 芝 / ダート / 障
+    meta.distance = toInt(course[1].replace(/,/g, ""));
+    meta.surface = course[2].split(/[・\/]/)[0].trim();
   }
 
-  // 天候・馬場(cap→txt ペア)
   const babaCell = html.match(/class="cell baba"([\s\S]*?)<\/ul>/);
   if (babaCell) {
     const pairs = [...babaCell[1].matchAll(/<span class="cap">([^<]*)<\/span><span class="txt">([\s\S]*?)<\/span>/g)];
@@ -292,7 +275,6 @@ function parseResult(html) {
   const nameCell = html.match(/class="race_name">([\s\S]*?)<\/(div|h1|h2)>/);
   if (nameCell) meta.name = stripTags(nameCell[1]);
 
-  // 着順テーブル
   const horses = [];
   const tbl = html.match(/<table class="basic narrow-xy striped"[\s\S]*?<tbody>([\s\S]*?)<\/tbody>/);
   if (tbl) {
@@ -330,118 +312,77 @@ function parseResult(html) {
   return { meta, horses };
 }
 
-// 月別カレンダーJSONから、指定期間の重賞レース [{date, name, detail, grade}] を列挙
-async function fetchGradedRaces(fromDate, toDate) {
-  const months = new Set();
-  const start = new Date(fromDate + "T00:00:00+09:00");
-  const end = new Date(toDate + "T00:00:00+09:00");
-  for (let d = new Date(start); d <= end; d.setMonth(d.getMonth() + 1)) {
-    months.add(`${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}`);
-  }
-
-  const out = [];
-  for (const ym of [...months].sort()) {
-    let blocks;
-    try {
-      blocks = await getJson(CAL_JSON(ym));
-    } catch (e) {
-      console.warn(`  ! カレンダーJSON取得失敗 ${ym}: ${e.message}`);
-      continue;
-    }
-    for (const b of blocks) {
-      for (const d of b.data ?? []) {
-        const day = Number(d.date);
-        if (!day) continue;
-        const date = `${ym.slice(0, 4)}-${ym.slice(4, 6)}-${String(day).padStart(2, "0")}`;
-        if (date < fromDate || date > toDate) continue;
-        for (const info of d.info ?? []) {
-          for (const g of info.gradeRace ?? []) {
-            if (!g.name) continue;
-            out.push({ date, name: g.name, detail: g.detail || g.name, grade: g.grade || null });
-          }
-        }
-      }
-    }
-  }
-  return out;
-}
-
 // ---- メイン ----
 async function main() {
-  const today = new Date();
-  const toDate = today.toISOString().slice(0, 10);
-  const fromD = new Date(today);
-  fromD.setMonth(fromD.getMonth() - MONTHS_BACK); // 既定12ヶ月。--months で拡張
-  const fromDate = fromD.toISOString().slice(0, 10);
-
-  console.log(`■ 重賞結果バックフィル  期間 ${fromDate} 〜 ${toDate}`);
-  console.log(`  DRY=${DRY}  LIMIT=${LIMIT}  DELAY=${DELAY_MS}ms`);
+  console.log(`■ 全レース結果バックフィル  期間 ${fromDate} 〜 ${toDate}(当日・未来は除外)`);
+  console.log(`  DRY=${DRY}  LIMIT=${LIMIT}  SKIP_EXISTING=${SKIP_EXISTING}  DELAY=${DELAY_MS}ms`);
 
   if (!DRY && (!SUPABASE_URL || !SERVICE_KEY)) {
     throw new Error(".env に NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY が必要です");
   }
   const supabase = DRY ? null : createClient(SUPABASE_URL, SERVICE_KEY);
+  const t0 = Date.now();
 
-  console.log("① 重賞レースを列挙(カレンダーJSON)…");
-  let graded = await fetchGradedRaces(fromDate, toDate);
-  // 未来・当日は結果が無いので除外
-  graded = graded.filter((g) => g.date < toDate).sort((a, b) => a.date.localeCompare(b.date));
-  console.log(`   → ${graded.length} 件の重賞`);
-
-  // 既にDBにある重賞は取得しない(--skip-existing 指定時)。未取得分だけの再実行に使う。
+  // 既存 (date, track, race_no) の集合。--skip-existing 時、結果ページを叩く前にスキップする。
+  // race_results は増える一方なので、Supabase の1000行上限に当たらないようページングして全件取る。
+  let existing = new Set();
   if (SKIP_EXISTING && supabase) {
-    const { data: existRows } = await supabase.from("race_results").select("date, name");
-    const have = new Set((existRows ?? []).map((r) => `${r.date}|${r.name}`));
-    const before = graded.length;
-    graded = graded.filter((g) => !have.has(`${g.date}|${g.name}`));
-    console.log(`   → 既存 ${before - graded.length} 件をスキップ、残 ${graded.length} 件を取得`);
+    let from = 0;
+    for (;;) {
+      const { data, error } = await supabase
+        .from("race_results")
+        .select("date, track, race_no")
+        .range(from, from + 999);
+      if (error) throw new Error(`race_results select: ${error.message}`);
+      for (const r of data) existing.add(`${r.date}|${r.track}|${r.race_no}`);
+      if (data.length < 1000) break;
+      from += 1000;
+    }
+    console.log(`   → 既存 ${existing.size} 件を skip-existing 判定に使用`);
   }
 
-  console.log("② 開催日リンクを収集(月ページを遡上)…");
-  const dayMap = await collectDayLinks();
-  console.log(`   → ${Object.keys(dayMap).length} 開催日分のリンク`);
+  console.log("① 開催日リンクを収集(月ページを遡上)…");
+  const dayMap = await collectDayLinks(fromDate);
+  const dates = Object.keys(dayMap)
+    .filter((d) => d >= fromDate && d <= toDate && d < todayStr)
+    .sort();
+  console.log(`   → 対象期間内 ${dates.length} 開催日`);
 
-  const targets = graded.slice(0, LIMIT === Infinity ? graded.length : LIMIT);
-  const selCache = new Map(); // dayCname -> parseSelection結果
+  console.log("② 各開催日・各場の選択ページから全レースを列挙…");
+  const targets = [];
+  let skippedPre = 0;
+  for (const date of dates) {
+    for (const dc of dayMap[date]) {
+      const selHtml = await post(dc);
+      const hdr = parseSelectionHeader(selHtml);
+      if (!hdr.track) {
+        console.warn(`  ! ${date} ${dc} … 選択ページから開催場を特定できず、この場をスキップ`);
+        continue;
+      }
+      const races = parseSelection(selHtml);
+      for (const r of races) {
+        const key = `${date}|${hdr.track}|${r.raceNo}`;
+        if (SKIP_EXISTING && existing.has(key)) {
+          skippedPre++;
+          continue;
+        }
+        targets.push({ date, track: hdr.track, raceNo: r.raceNo, name: r.name, sde: r.sde });
+      }
+    }
+  }
+  console.log(
+    `   → ${targets.length} レースが対象(既存スキップ ${skippedPre} 件、現時点でのHTTPリクエスト計 ${reqCount})`,
+  );
+
+  const finalTargets = targets.slice(0, LIMIT === Infinity ? targets.length : LIMIT);
   let ok = 0,
-    miss = 0,
     fail = 0;
 
-  console.log(`③ 各重賞の結果を取得(${targets.length}件)…`);
-  for (const [i, g] of targets.entries()) {
-    const tag = `[${i + 1}/${targets.length}] ${g.date} ${g.grade ?? ""} ${g.name}`;
+  console.log(`③ 各レースの結果を取得(${finalTargets.length}件)…`);
+  for (const [i, tg] of finalTargets.entries()) {
+    const tag = `[${i + 1}/${finalTargets.length}] ${tg.date} ${tg.track}${tg.raceNo}R ${tg.name}`;
     try {
-      const dayCnames = [...(dayMap[g.date] ?? [])];
-      if (dayCnames.length === 0) {
-        console.warn(`  ✗ ${tag} … 開催日リンク未発見`);
-        miss++;
-        continue;
-      }
-      // 開催日候補(複数場)の中から、そのレース名を含む選択ページを特定
-      let matched = null;
-      const seenNames = [];
-      for (const dc of dayCnames) {
-        let races = selCache.get(dc);
-        if (!races) {
-          const selHtml = await post(dc);
-          races = parseSelection(selHtml);
-          selCache.set(dc, races);
-        }
-        const hit = matchRace(races, g);
-        if (hit) {
-          matched = hit;
-          break;
-        }
-        for (const r of races) if (r.raceNo >= 9) seenNames.push(`${r.raceNo}R:${r.name}`);
-      }
-      if (!matched) {
-        console.warn(`  ✗ ${tag} … 一致なし`);
-        if (DEBUG) console.warn(`      候補(9R以降): ${seenNames.join(" / ")}`);
-        miss++;
-        continue;
-      }
-
-      const resHtml = await post(matched.sde);
+      const resHtml = await post(tg.sde);
       const { meta, horses } = parseResult(resHtml);
       if (horses.length === 0) {
         console.warn(`  ✗ ${tag} … 着順テーブルが空`);
@@ -450,21 +391,21 @@ async function main() {
       }
 
       const record = {
-        date: g.date,
-        track: meta.track ?? null,
-        race_no: raceNoFromSde(matched.sde) ?? matched.raceNo ?? meta.raceNo ?? null,
-        name: g.name,
-        grade: g.grade,
+        date: meta.date ?? tg.date,
+        track: meta.track ?? tg.track,
+        race_no: raceNoFromSde(tg.sde) ?? tg.raceNo ?? meta.raceNo ?? null,
+        name: tg.name,
+        grade: null, // OP/リステッド/条件戦のグレード判定は今回対象外(常にnull)
         surface: meta.surface ?? null,
         distance: meta.distance ?? null,
         going: meta.going ?? null,
         weather: meta.weather ?? null,
-        cname: matched.sde,
+        cname: tg.sde,
       };
 
       if (DRY) {
         console.log(
-          `  ○ ${tag}  ${record.track ?? "?"}${record.race_no ?? "?"}R ${record.surface ?? ""}${record.distance ?? ""}m ${record.going ?? ""}(${meta.weather ?? "?"}) / ${horses.length}頭  1着=${horses.find((h) => h.place === 1)?.name ?? "?"}`,
+          `  ○ ${tag}  ${record.surface ?? ""}${record.distance ?? ""}m ${record.going ?? ""}(${meta.weather ?? "?"}) / ${horses.length}頭  1着=${horses.find((h) => h.place === 1)?.name ?? "?"}`,
         );
         if (VERBOSE) {
           for (const h of horses.slice(0, 3)) {
@@ -482,14 +423,14 @@ async function main() {
             .single();
           if (error) throw new Error(`race_results upsert: ${error.message}`);
           return data;
-        }, `upsert race_results ${g.name}`);
+        }, `upsert race_results ${tg.name}`);
         const rows = horses.map((h) => ({ ...h, result_id: rr.id }));
         await withRetry(async () => {
           const { error } = await supabase
             .from("result_horses")
             .upsert(rows, { onConflict: "result_id,umaban" });
           if (error) throw new Error(`result_horses upsert: ${error.message}`);
-        }, `upsert result_horses ${g.name}`);
+        }, `upsert result_horses ${tg.name}`);
         console.log(`  ○ ${tag}  → 保存(${horses.length}頭)`);
       }
       ok++;
@@ -499,8 +440,11 @@ async function main() {
     }
   }
 
+  const elapsedSec = Math.round((Date.now() - t0) / 1000);
   console.log("──────────────────────────────");
-  console.log(`完了: 成功 ${ok} / 未発見 ${miss} / 失敗 ${fail}  (HTTPリクエスト計 ${reqCount})`);
+  console.log(
+    `完了: 成功 ${ok} / 失敗 ${fail} / 既存スキップ ${skippedPre}  (HTTPリクエスト計 ${reqCount}、所要 ${elapsedSec}秒)`,
+  );
 }
 
 main().catch((e) => {

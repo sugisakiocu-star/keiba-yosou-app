@@ -53,6 +53,9 @@ create policy "horses anon read" on horses for select to anon using (true);
 -- ============================================================================
 
 -- レース結果(1レース = 1行)。
+-- ⚠️ unique制約はフェーズ4Eで (date, track, name) → (date, track, race_no) に変更済み。
+--   条件戦は同日同場に同名レース(例: 同じ「3歳未勝利」)が複数走るため、レース名では一意にならない。
+--   適用済みのDBには supabase/migration-phase4e.sql を SQL Editor で実行する。
 create table race_results (
   id         bigint generated always as identity primary key,
   date       date not null,               -- 開催日 (YYYY-MM-DD)
@@ -66,7 +69,7 @@ create table race_results (
   weather    text,                         -- 天候 (晴/曇/雨 など)
   cname      text,                         -- 結果ページの pw01sde コード (再取得・デバッグ用)
   fetched_at timestamptz default now(),
-  unique (date, track, name)               -- 同一開催日・場・レース名は1行 (upsert のキー)
+  unique (date, track, race_no)            -- 同一開催日・場・R は1行 (upsert のキー)
 );
 
 -- 着順(1頭 = 1行)。race_results に紐づく。
