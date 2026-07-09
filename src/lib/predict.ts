@@ -1,15 +1,17 @@
-// 簡易予想スコア(フェーズ4C「まず雑に予想」)。
-// 過去1年の重賞結果(race_results / result_horses)だけを材料に、出馬表の各馬を採点する。
+// 簡易予想スコア(フェーズ4C→4A拡張)。
+// 出馬表の各馬を、過去1年の重賞結果(race_results)+ 出馬表に埋まっていた直近4走(horse_past_runs)で採点する。
 //
-// スコア = 馬の重賞実績 + 騎手の重賞複勝率 + 斤量(ハンデ差)
-//  - 馬: 着順ポイント × グレード重み × 直近重み + 距離適性ボーナス を平均し、走数が少ないほど縮める
+// スコア = 馬の重賞実績 + 近走の調子(フォーム)+ 騎手の重賞複勝率 + 斤量(ハンデ差)
+//  - 重賞実績: 着順ポイント × グレード重み × 直近重み + 距離適性 を平均し、走数が少ないほど縮める
+//  - 近走(4A): 直近4走の着順を前走ほど重く評価 + 当該コース(距離/芝ダ)適性。
+//    重賞履歴に出てこない条件戦好走馬(サヴォーナ等)を拾うのが狙い。
 //  - 騎手: 過去1年重賞の複勝率 × 30(騎乗5回未満は標本不足として中立=0)
 //  - 斤量: (出走馬平均 − 自身の斤量) × 2(ハンデ戦では軽いほうがプラス)
 //
-// あくまで「まず動く」ための透明な採点。精度は未検証(バックテストはフェーズ4Dで)。
+// あくまで「まず動く」ための透明な採点。精度はバックテスト(scripts/backtest.mjs)で検証する。
 
 import { createClient } from "@supabase/supabase-js";
-import type { RaceCard, Grade } from "@/lib/racing-data";
+import type { RaceCard, Grade, PastRun } from "@/lib/racing-data";
 
 export interface PredictedHorse {
   mark: string | null; // ◎ ○ ▲ △(上位5頭)
@@ -19,10 +21,23 @@ export interface PredictedHorse {
   total: number; // 合計スコア
   barPct: number; // フィールド内最大を100とした相対値(バー表示用)
   horsePts: number;
+  formPts: number; // 近走(直近4走)の調子スコア
   jockeyPts: number;
   weightPts: number;
   jockeyRate: number | null; // 騎手の重賞複勝率(標本不足なら null)
   runsLabel: string; // 例: "G3 1着・G2 2着・G3 6着" / "重賞実績なし"
+  formLabel: string; // 例: "前走G2 10着 / 芝2000◎" / "近走データなし"
+}
+
+// 当該レースのコース条件(距離・芝ダ)。距離適性の判定に使う。
+export type Target = { distance: number | null; surface: string | null };
+
+// コース適性ボーナス: 同じ芝ダで、距離が目標の±300m以内なら 1、それ以外 0。
+// target が不明(距離未取得)なら判定不能として 0。
+function aptBonus(surface: string | null, distance: number | null, target: Target): number {
+  if (target.distance == null || target.surface == null) return 0;
+  if (surface !== target.surface) return 0;
+  return Math.abs((distance ?? 0) - target.distance) <= 300 ? 1 : 0;
 }
 
 export interface RacePrediction {
@@ -64,7 +79,12 @@ const placePts = (p: number | null): number =>
   p === 1 ? 10 : p === 2 ? 7 : p === 3 ? 5 : p === 4 ? 3 : p === 5 ? 2 : p != null && p <= 9 ? 1 : 0;
 
 // 馬の重賞実績スコア。runs は障害を除いた過去1年の重賞成績。
-export function scoreHorse(runs: HistRow[], now: Date): { pts: number; label: string } {
+// target を渡すと距離適性を当該レースのコースで判定する(未指定なら適性ボーナス無し)。
+export function scoreHorse(
+  runs: HistRow[],
+  now: Date,
+  target: Target = { distance: null, surface: null },
+): { pts: number; label: string } {
   if (runs.length === 0) return { pts: 0, label: "重賞実績なし" };
   let total = 0;
   const labels: string[] = [];
@@ -72,14 +92,10 @@ export function scoreHorse(runs: HistRow[], now: Date): { pts: number; label: st
     const gw = GRADE_W[r.race_results.grade ?? ""] ?? 1.0;
     const ageMonths = (now.getTime() - new Date(r.race_results.date).getTime()) / (1000 * 3600 * 24 * 30);
     const rw = ageMonths <= 3 ? 1.2 : ageMonths <= 6 ? 1.0 : 0.8; // 直近重視
-    // 距離適性: 芝1800〜2200mで5着以内なら+1(七夕賞=芝2000を想定した中距離適性)
+    // 距離適性: 当該レースと同じ芝ダ・近い距離で5着以内なら +1
     const apt =
-      r.race_results.surface === "芝" &&
-      (r.race_results.distance ?? 0) >= 1800 &&
-      (r.race_results.distance ?? 0) <= 2200 &&
-      r.place != null &&
-      r.place <= 5
-        ? 1
+      r.place != null && r.place <= 5
+        ? aptBonus(r.race_results.surface, r.race_results.distance, target)
         : 0;
     total += placePts(r.place) * gw * rw + apt;
     labels.push(`${r.race_results.grade ?? ""}${r.place ?? "×"}着`);
@@ -87,6 +103,38 @@ export function scoreHorse(runs: HistRow[], now: Date): { pts: number; label: st
   // 平均ベース。走数3未満は縮める(1走の好走を過大評価しない)
   const pts = (total / runs.length) * Math.min(1, runs.length / 3) * 10;
   return { pts, label: labels.join(" ") };
+}
+
+// 近走(直近4走)の調子スコア。past は最新順(runNo 1=前走)。
+//  - 前走ほど重く着順を評価(recencyW)
+//  - 頭数の多いレースでの好走を少し高く(strengthMul)
+//  - 当該コース(距離/芝ダ)への適性を加点(全レース固定だった旧仕様のバグ解消)
+export function scoreForm(past: PastRun[], target: Target): { pts: number; label: string } {
+  const runs = past.filter((p) => p.place != null); // 中止・除外(place=null)は評価対象外
+  if (runs.length === 0) return { pts: 0, label: "近走データなし" };
+  const recencyW = (runNo: number): number =>
+    runNo <= 1 ? 1.0 : runNo === 2 ? 0.75 : runNo === 3 ? 0.55 : 0.4;
+
+  let raw = 0;
+  let apt = 0;
+  for (const p of runs) {
+    const rw = recencyW(p.runNo);
+    const strengthMul = p.fieldSize != null ? Math.min(1.2, Math.max(0.7, p.fieldSize / 14)) : 1;
+    raw += placePts(p.place) * rw * strengthMul;
+    if (p.place != null && p.place <= 5) apt += aptBonus(p.surface, p.distance, target) * rw * 2;
+  }
+  // 平均ベース。走数2未満は縮める。K=6 で重賞実績スコアと同オーダーに。
+  const pts = (raw / runs.length) * Math.min(1, runs.length / 2) * 6 + apt;
+
+  // ラベル: 前走成績 + 当該コース好走があれば印
+  const p1 = runs.find((p) => p.runNo === 1) ?? runs[0];
+  const aptRun = runs.find(
+    (p) => p.place != null && p.place <= 5 && aptBonus(p.surface, p.distance, target) > 0,
+  );
+  const parts = [`前走${p1.grade ?? ""}${p1.placeText ?? ""}`];
+  if (aptRun && target.distance != null)
+    parts.push(`${target.surface}${target.distance}◎`);
+  return { pts, label: parts.join(" / ") };
 }
 
 // 騎手の重賞複勝率スコア。騎乗5回未満は標本不足として中立。
@@ -140,6 +188,7 @@ export async function buildPredictions(cards: RaceCard[]): Promise<RacePredictio
 
   const now = new Date();
   return cards.map((card) => {
+    const target: Target = { distance: card.distance, surface: card.surface };
     const withWeight = card.horses.filter((h) => h.weightCarry != null);
     const avgWeight =
       withWeight.length > 0
@@ -151,20 +200,23 @@ export async function buildPredictions(cards: RaceCard[]): Promise<RacePredictio
       const runs = hist.filter(
         (r) => r.name === h.name && !String(r.race_results?.grade ?? "").startsWith("J"),
       );
-      const hs = scoreHorse(runs, now);
+      const hs = scoreHorse(runs, now, target);
+      const fs = scoreForm(h.past ?? [], target);
       const js = scoreJockey(jhist.filter((r) => r.jockey === h.jockey));
       const wPts = h.weightCarry != null && avgWeight > 0 ? (avgWeight - h.weightCarry) * 2 : 0;
       return {
         name: h.name,
         jockey: h.jockey,
         weightCarry: h.weightCarry,
-        total: hs.pts + js.pts + wPts,
+        total: hs.pts + fs.pts + js.pts + wPts,
         barPct: 0, // 後で埋める
         horsePts: hs.pts,
+        formPts: fs.pts,
         jockeyPts: js.pts,
         weightPts: wPts,
         jockeyRate: js.rate,
         runsLabel: hs.label,
+        formLabel: fs.label,
         mark: null as string | null,
       };
     });

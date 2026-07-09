@@ -113,6 +113,21 @@ async function getRecentResults(): Promise<RaceResult[]> {
   }
 }
 
+type PastRunRow = {
+  run_no: number;
+  date: string | null;
+  track: string | null;
+  race_name: string | null;
+  grade: string | null;
+  place: number | null;
+  place_text: string | null;
+  field_size: number | null;
+  popularity: number | null;
+  distance: number | null;
+  surface: string | null;
+  going: string | null;
+  last3f: number | null;
+};
 type EntryHorseRow = {
   waku: number | null;
   umaban: number | null;
@@ -121,6 +136,7 @@ type EntryHorseRow = {
   weight_carry: number | null;
   jockey: string | null;
   trainer: string | null;
+  horse_past_runs: PastRunRow[];
 };
 type RaceCardRow = {
   id: number;
@@ -129,6 +145,8 @@ type RaceCardRow = {
   race_no: number | null;
   name: string | null;
   grade: string | null;
+  distance: number | null;
+  surface: string | null;
   horses: EntryHorseRow[];
 };
 
@@ -144,7 +162,7 @@ async function getRaceCards(): Promise<RaceCard[]> {
     const { data, error } = await supabase
       .from("races")
       .select(
-        "id, date, track, race_no, name, grade, horses(waku, umaban, name, sex_age, weight_carry, jockey, trainer)",
+        "id, date, track, race_no, name, grade, distance, surface, horses(waku, umaban, name, sex_age, weight_carry, jockey, trainer, horse_past_runs(run_no, date, track, race_name, grade, place, place_text, field_size, popularity, distance, surface, going, last3f))",
       )
       .gte("date", today)
       .order("date", { ascending: true })
@@ -161,10 +179,31 @@ async function getRaceCards(): Promise<RaceCard[]> {
           weightCarry: h.weight_carry,
           jockey: h.jockey,
           trainer: h.trainer,
+          past: (h.horse_past_runs ?? [])
+            .map((p) => ({
+              runNo: p.run_no,
+              date: p.date,
+              track: p.track,
+              raceName: p.race_name,
+              grade: p.grade,
+              place: p.place,
+              placeText: p.place_text,
+              fieldSize: p.field_size,
+              popularity: p.popularity,
+              distance: p.distance,
+              surface: p.surface,
+              going: p.going,
+              last3f: p.last3f,
+            }))
+            .sort((a, b) => a.runNo - b.runNo), // 前走(1)→4走前(4)
         }))
         // 枠順確定済みなら馬番順、未確定(馬番null)なら50音順(取得順)を維持
         .sort((a, b) => (a.umaban ?? 999) - (b.umaban ?? 999));
       const feat = FEATURE_RACES.find((f) => f.name === r.name);
+      const course =
+        r.distance != null
+          ? [r.surface, `${r.distance}m`].filter(Boolean).join(" ")
+          : feat?.course;
       return {
         id: String(r.id),
         date: r.date,
@@ -173,7 +212,9 @@ async function getRaceCards(): Promise<RaceCard[]> {
         raceNo: r.race_no ?? 0,
         name: r.name ?? "",
         grade: (r.grade as Grade) ?? feat?.grade,
-        course: feat?.course,
+        course,
+        distance: r.distance,
+        surface: r.surface,
         gateConfirmed: horses.length > 0 && horses.every((h) => h.umaban != null),
         horses,
       } satisfies RaceCard;

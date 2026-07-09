@@ -56,6 +56,23 @@ export const FEATURE_RACES: FeatureRace[] = [
   },
 ];
 
+// 過去走(1走)。horse_past_runs から取得。出馬表に埋まっていた各馬の直近4走。
+export interface PastRun {
+  runNo: number; // 1=前走 … 4=4走前
+  date: string | null;
+  track: string | null;
+  raceName: string | null;
+  grade: string | null;
+  place: number | null;
+  placeText: string | null;
+  fieldSize: number | null;
+  popularity: number | null;
+  distance: number | null;
+  surface: string | null; // 芝/ダート/障
+  going: string | null;
+  last3f: number | null;
+}
+
 // 出馬表(1頭)。枠順確定前は waku/umaban が null。
 export interface EntryHorse {
   waku: number | null;
@@ -65,6 +82,7 @@ export interface EntryHorse {
   weightCarry: number | null;
   jockey: string | null;
   trainer: string | null;
+  past: PastRun[]; // 直近4走(最新順)。未取得なら空
 }
 
 // 出馬表(1レース)。races + horses から構築する。
@@ -76,7 +94,9 @@ export interface RaceCard {
   raceNo: number;
   name: string;
   grade?: Grade;
-  course?: string; // FEATURE_RACES から補完(races には距離/馬場が無いため)
+  course?: string; // 表示用。races.distance/surface があればそれを、無ければ FEATURE_RACES から補完
+  distance: number | null; // 距離(m)。予想の距離適性判定に使う(races.distance)
+  surface: string | null; // 芝/ダート/障(races.surface)
   gateConfirmed: boolean; // 全馬に馬番が付いていれば枠順確定済み
   horses: EntryHorse[];
 }

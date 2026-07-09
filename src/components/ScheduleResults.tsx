@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import type { RaceResult, RaceCard, Grade } from "@/lib/racing-data";
+import type { RaceResult, RaceCard, Grade, EntryHorse } from "@/lib/racing-data";
 import { WAKU_COLORS } from "@/lib/racing-data";
 import type { RacePrediction } from "@/lib/predict";
 import { GradeBadge, Umaban } from "@/components/racing-bits";
@@ -168,7 +168,93 @@ function EntryUmaban({ waku, num }: { waku: number | null; num: number | null })
   );
 }
 
+// 過去走1走の要約行(例: "3/28 中山 日経賞G2 10着/15頭 6人気 芝2500 良 上34.6")
+function pastRunLine(p: EntryHorse["past"][number]): string {
+  const md = p.date ? p.date.slice(5).replace("-", "/") : "";
+  const course = [p.distance ? `${p.surface ?? ""}${p.distance}` : null, p.going].filter(Boolean).join(" ");
+  const result =
+    p.placeText ??
+    (p.place != null ? `${p.place}着` : "");
+  return [
+    md,
+    p.track ?? "",
+    `${p.raceName ?? ""}${p.grade ?? ""}`,
+    p.fieldSize != null ? `${result}/${p.fieldSize}頭` : result,
+    p.popularity != null ? `${p.popularity}人気` : "",
+    course,
+    p.last3f != null ? `上${p.last3f}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+// 出馬表の1頭。タップで直近4走を開閉する。
+function HorseEntryRow({ h }: { h: EntryHorse }) {
+  const [open, setOpen] = useState(false);
+  const hasPast = h.past.length > 0;
+  return (
+    <>
+      <tr
+        className="border-b last:border-b-0"
+        style={{ borderColor: "var(--paper-dark)", cursor: hasPast ? "pointer" : "default" }}
+        onClick={() => hasPast && setOpen((v) => !v)}
+      >
+        <td className="w-10 py-2 pl-4">
+          <EntryUmaban waku={h.waku} num={h.umaban} />
+        </td>
+        <td className="font-bold">
+          {h.name}
+          {hasPast && (
+            <span className="ml-1.5 text-xs" style={{ color: "var(--ink-soft)" }}>
+              {open ? "▲" : "▼"}
+            </span>
+          )}
+        </td>
+        <td className="w-12 text-center text-xs" style={{ color: "var(--ink-soft)" }}>
+          {h.sexAge}
+        </td>
+        <td className="font-display w-14 text-right text-sm" style={{ color: "var(--turf)" }}>
+          {h.weightCarry != null ? h.weightCarry.toFixed(1) : ""}
+        </td>
+        <td className="pr-3 text-right" style={{ color: "var(--ink-soft)" }}>
+          {h.jockey}
+        </td>
+        <td className="w-24 pr-4 text-right text-xs" style={{ color: "var(--ink-soft)" }}>
+          {h.trainer}
+        </td>
+      </tr>
+      {open && hasPast && (
+        <tr style={{ background: "var(--paper-dark)" }}>
+          <td colSpan={6} className="px-4 py-2">
+            <div className="mb-1 text-xs font-bold" style={{ color: "var(--ink-soft)" }}>
+              直近{h.past.length}走(新しい順)
+            </div>
+            <ul className="space-y-1">
+              {h.past.map((p) => (
+                <li
+                  key={p.runNo}
+                  className="flex items-center gap-2 text-xs"
+                  style={{ color: "var(--ink)" }}
+                >
+                  <span
+                    className="font-display w-8 shrink-0 text-center font-bold"
+                    style={{ color: p.place === 1 ? "var(--gold)" : "var(--ink-soft)" }}
+                  >
+                    {p.place != null ? `${p.place}着` : p.placeText ?? "-"}
+                  </span>
+                  <span>{pastRunLine(p)}</span>
+                </li>
+              ))}
+            </ul>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
 function EntryCard({ r }: { r: RaceCard }) {
+  const anyPast = r.horses.some((h) => h.past.length > 0);
   return (
     <div
       className="result-card border bg-white/70"
@@ -191,28 +277,7 @@ function EntryCard({ r }: { r: RaceCard }) {
       <table className="w-full text-sm">
         <tbody>
           {r.horses.map((h) => (
-            <tr
-              key={h.name}
-              className="border-b last:border-b-0"
-              style={{ borderColor: "var(--paper-dark)" }}
-            >
-              <td className="w-10 py-2 pl-4">
-                <EntryUmaban waku={h.waku} num={h.umaban} />
-              </td>
-              <td className="font-bold">{h.name}</td>
-              <td className="w-12 text-center text-xs" style={{ color: "var(--ink-soft)" }}>
-                {h.sexAge}
-              </td>
-              <td className="font-display w-14 text-right text-sm" style={{ color: "var(--turf)" }}>
-                {h.weightCarry != null ? h.weightCarry.toFixed(1) : ""}
-              </td>
-              <td className="pr-3 text-right" style={{ color: "var(--ink-soft)" }}>
-                {h.jockey}
-              </td>
-              <td className="w-24 pr-4 text-right text-xs" style={{ color: "var(--ink-soft)" }}>
-                {h.trainer}
-              </td>
-            </tr>
+            <HorseEntryRow key={h.name} h={h} />
           ))}
         </tbody>
       </table>
@@ -220,6 +285,7 @@ function EntryCard({ r }: { r: RaceCard }) {
         className="px-4 py-2 text-xs"
         style={{ background: "var(--paper-dark)", color: "var(--ink-soft)" }}
       >
+        {anyPast ? "馬名をタップで直近4走を表示。" : ""}
         {r.gateConfirmed ? "枠順確定・馬番順" : "枠順は前々日(金)に確定します。現在は50音順・枠/馬番は未定"}
       </div>
     </div>
@@ -298,10 +364,11 @@ function PredictionCard({ p }: { p: RacePrediction }) {
                 </div>
               </td>
               <td
-                className="hidden max-w-40 pr-2 text-right text-xs sm:table-cell"
+                className="hidden max-w-44 pr-2 text-right text-xs sm:table-cell"
                 style={{ color: "var(--ink-soft)" }}
               >
-                {h.runsLabel}
+                <div>{h.runsLabel}</div>
+                <div style={{ color: "var(--turf)" }}>{h.formLabel}</div>
               </td>
               <td className="w-40 pr-4 text-right text-xs" style={{ color: "var(--ink-soft)" }}>
                 <div>{h.jockey}</div>
@@ -318,7 +385,7 @@ function PredictionCard({ p }: { p: RacePrediction }) {
         className="px-4 py-2 text-xs"
         style={{ background: "var(--paper-dark)", color: "var(--ink-soft)" }}
       >
-        スコア = 過去1年の重賞実績(グレード・直近・中距離適性で重み付け)+ 騎手の重賞複勝率 + 斤量差
+        スコア = 重賞実績 + 近走の調子(直近4走・コース適性)+ 騎手の重賞複勝率 + 斤量差
       </div>
     </div>
   );
