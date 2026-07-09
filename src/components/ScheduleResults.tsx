@@ -1,7 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import type { RaceResult, Grade } from "@/lib/racing-data";
+import type { RaceResult, RaceCard, Grade } from "@/lib/racing-data";
+import { WAKU_COLORS } from "@/lib/racing-data";
 import { GradeBadge, Umaban } from "@/components/racing-bits";
 
 export interface ScheduleDay {
@@ -139,6 +140,111 @@ function ResultCard({ r }: { r: RaceResult }) {
   );
 }
 
+// 枠/馬番チップ。枠順未確定(番号 null)なら灰色の「-」を出す。
+function EntryUmaban({ waku, num }: { waku: number | null; num: number | null }) {
+  if (num == null || waku == null) {
+    return (
+      <span
+        className="umaban"
+        style={{ background: "#e5e0d2", color: "#8a8266", border: "1px solid var(--dirt)" }}
+      >
+        –
+      </span>
+    );
+  }
+  const c = WAKU_COLORS[waku] ?? { bg: "#ddd", fg: "#1a1a1a" };
+  return (
+    <span
+      className="umaban"
+      style={{
+        background: c.bg,
+        color: c.fg,
+        border: c.border ? `1px solid ${c.border}` : "1px solid transparent",
+      }}
+    >
+      {num}
+    </span>
+  );
+}
+
+function EntryCard({ r }: { r: RaceCard }) {
+  return (
+    <div
+      className="result-card border bg-white/70"
+      style={{ borderColor: "var(--turf)", borderWidth: 1.5 }}
+    >
+      <div
+        className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-2.5"
+        style={{ borderColor: "var(--paper-dark)" }}
+      >
+        {r.grade && <GradeBadge grade={r.grade} />}
+        <span className="font-display text-lg font-bold">{r.name}</span>
+        <span className="text-xs font-bold" style={{ color: "var(--ink-soft)" }}>
+          {r.dayLabel} {r.track}
+          {r.raceNo}R{r.course ? `・${r.course}` : ""}
+        </span>
+        <span className="ml-auto text-xs" style={{ color: "var(--ink-soft)" }}>
+          {r.horses.length}頭
+        </span>
+      </div>
+      <table className="w-full text-sm">
+        <tbody>
+          {r.horses.map((h) => (
+            <tr
+              key={h.name}
+              className="border-b last:border-b-0"
+              style={{ borderColor: "var(--paper-dark)" }}
+            >
+              <td className="w-10 py-2 pl-4">
+                <EntryUmaban waku={h.waku} num={h.umaban} />
+              </td>
+              <td className="font-bold">{h.name}</td>
+              <td className="w-12 text-center text-xs" style={{ color: "var(--ink-soft)" }}>
+                {h.sexAge}
+              </td>
+              <td className="font-display w-14 text-right text-sm" style={{ color: "var(--turf)" }}>
+                {h.weightCarry != null ? h.weightCarry.toFixed(1) : ""}
+              </td>
+              <td className="pr-3 text-right" style={{ color: "var(--ink-soft)" }}>
+                {h.jockey}
+              </td>
+              <td className="w-24 pr-4 text-right text-xs" style={{ color: "var(--ink-soft)" }}>
+                {h.trainer}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div
+        className="px-4 py-2 text-xs"
+        style={{ background: "var(--paper-dark)", color: "var(--ink-soft)" }}
+      >
+        {r.gateConfirmed ? "枠順確定・馬番順" : "枠順は前々日(金)に確定します。現在は50音順・枠/馬番は未定"}
+      </div>
+    </div>
+  );
+}
+
+function EntriesSection({ raceCards }: { raceCards: RaceCard[] }) {
+  if (raceCards.length === 0) {
+    return (
+      <p className="rounded border border-[var(--turf)] bg-white/70 px-5 py-6 text-sm text-[var(--ink-soft)]">
+        出馬表データがまだありません(重賞の出馬表公開後に取得されます)
+      </p>
+    );
+  }
+  return (
+    <div className="space-y-4">
+      {raceCards.map((r) => (
+        <EntryCard key={r.id} r={r} />
+      ))}
+      <p className="text-xs" style={{ color: "var(--ink-soft)" }}>
+        ※ 出馬表。データ出典:JRA公式。枠順確定後に枠番・馬番が反映されます。
+      </p>
+    </div>
+  );
+}
+
 function ResultsSection({
   results,
   isSample,
@@ -171,16 +277,25 @@ function ResultsSection({
   );
 }
 
+const TAB_HEADINGS: Record<"schedule" | "entries" | "results", [string, string]> = {
+  schedule: ["今後の開催日程", "RACE CALENDAR"],
+  entries: ["今週の出馬表", "RACE CARD"],
+  results: ["先週の結果", "LAST WEEK RESULTS"],
+};
+
 export function ScheduleResults({
   days,
   results,
   resultsAreSample = false,
+  raceCards = [],
 }: {
   days: ScheduleDay[];
   results: RaceResult[];
   resultsAreSample?: boolean;
+  raceCards?: RaceCard[];
 }) {
-  const [tab, setTab] = useState<"schedule" | "results">("schedule");
+  const [tab, setTab] = useState<"schedule" | "entries" | "results">("schedule");
+  const [heading, subheading] = TAB_HEADINGS[tab];
 
   return (
     <>
@@ -192,6 +307,12 @@ export function ScheduleResults({
           開催日程
         </button>
         <button
+          className={`ticket-tab ${tab === "entries" ? "active" : ""}`}
+          onClick={() => setTab("entries")}
+        >
+          出馬表
+        </button>
+        <button
           className={`ticket-tab ${tab === "results" ? "active" : ""}`}
           onClick={() => setTab("results")}
         >
@@ -200,17 +321,15 @@ export function ScheduleResults({
       </div>
 
       <h2 className="rail-heading font-display mb-6 text-2xl font-bold">
-        {tab === "schedule" ? "今後の開催日程" : "先週の結果"}
+        {heading}
         <span className="ml-3 text-sm font-normal" style={{ color: "var(--ink-soft)" }}>
-          {tab === "schedule" ? "RACE CALENDAR" : "LAST WEEK RESULTS"}
+          {subheading}
         </span>
       </h2>
 
-      {tab === "schedule" ? (
-        <ScheduleSection days={days} />
-      ) : (
-        <ResultsSection results={results} isSample={resultsAreSample} />
-      )}
+      {tab === "schedule" && <ScheduleSection days={days} />}
+      {tab === "entries" && <EntriesSection raceCards={raceCards} />}
+      {tab === "results" && <ResultsSection results={results} isSample={resultsAreSample} />}
     </>
   );
 }

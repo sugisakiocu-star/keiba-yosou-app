@@ -3,6 +3,14 @@
     {
       "path": "/api/cron/fetch-schedule",
       "schedule": "0 0 1 * *"
+    },
+    {
+      "path": "/api/cron/fetch-shutuba",
+      "schedule": "0 12 * * 4"
+    },
+    {
+      "path": "/api/cron/fetch-shutuba",
+      "schedule": "0 9 * * 5"
     }
   ]
 }

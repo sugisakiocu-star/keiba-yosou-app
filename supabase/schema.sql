@@ -26,16 +26,24 @@ create table races (
 create table horses (
   id           bigint generated always as identity primary key,
   race_id      bigint not null references races(id) on delete cascade,
-  waku         int,                        -- 枠番
-  umaban       int,                        -- 馬番
+  waku         int,                        -- 枠番(枠順確定前は null)
+  umaban       int,                        -- 馬番(枠順確定前は null)
   name         text not null,              -- 馬名
   sex_age      text,                       -- 性齢 (例: 牡4)
   weight_carry numeric,                    -- 斤量
   jockey       text,                       -- 騎手
   trainer      text,                       -- 調教師
   fetched_at   timestamptz default now(),
-  unique (race_id, umaban)                 -- 同一レース内の同一馬番は1行 (upsert のキー)
+  -- 枠順は開催前々日(金曜)に確定するため、確定前は umaban が null。
+  -- upsert キーは常に一意な馬名にする(枠順確定後の再取得で waku/umaban を更新)。
+  unique (race_id, name)                   -- 同一レース内の同一馬は1行 (upsert のキー)
 );
+
+-- RLS: anon は読み取りのみ。書き込みは service_role(RLSバイパス)のバッチ/cronだけ。
+alter table races  enable row level security;
+alter table horses enable row level security;
+create policy "races anon read"  on races  for select to anon using (true);
+create policy "horses anon read" on horses for select to anon using (true);
 
 -- ============================================================================
 -- フェーズ3: 過去レース結果(成績)。scripts/backfill-graded-results.mjs が

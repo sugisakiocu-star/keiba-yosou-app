@@ -5,6 +5,7 @@ import {
   SAMPLE_RESULTS,
   type FeatureRace,
   type RaceResult,
+  type RaceCard,
   type Grade,
 } from "@/lib/racing-data";
 import { Hero } from "@/components/Hero";
@@ -111,6 +112,76 @@ async function getRecentResults(): Promise<RaceResult[]> {
   }
 }
 
+type EntryHorseRow = {
+  waku: number | null;
+  umaban: number | null;
+  name: string;
+  sex_age: string | null;
+  weight_carry: number | null;
+  jockey: string | null;
+  trainer: string | null;
+};
+type RaceCardRow = {
+  id: number;
+  date: string;
+  track: string;
+  race_no: number | null;
+  name: string | null;
+  grade: string | null;
+  horses: EntryHorseRow[];
+};
+
+// 今後の出馬表を races / horses から取得して UI 型に変換する。
+async function getRaceCards(): Promise<RaceCard[]> {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  if (!url?.startsWith("http") || !anonKey) return [];
+
+  const today = new Date().toISOString().slice(0, 10);
+  try {
+    const supabase = createClient(url, anonKey);
+    const { data, error } = await supabase
+      .from("races")
+      .select(
+        "id, date, track, race_no, name, grade, horses(waku, umaban, name, sex_age, weight_carry, jockey, trainer)",
+      )
+      .gte("date", today)
+      .order("date", { ascending: true })
+      .order("race_no", { ascending: true });
+    if (error || !data) return [];
+
+    return (data as RaceCardRow[]).map((r) => {
+      const horses = (r.horses ?? [])
+        .map((h) => ({
+          waku: h.waku,
+          umaban: h.umaban,
+          name: h.name,
+          sexAge: h.sex_age,
+          weightCarry: h.weight_carry,
+          jockey: h.jockey,
+          trainer: h.trainer,
+        }))
+        // 枠順確定済みなら馬番順、未確定(馬番null)なら50音順(取得順)を維持
+        .sort((a, b) => (a.umaban ?? 999) - (b.umaban ?? 999));
+      const feat = FEATURE_RACES.find((f) => f.name === r.name);
+      return {
+        id: String(r.id),
+        date: r.date,
+        dayLabel: dayLabelJP(r.date),
+        track: r.track,
+        raceNo: r.race_no ?? 0,
+        name: r.name ?? "",
+        grade: (r.grade as Grade) ?? feat?.grade,
+        course: feat?.course,
+        gateConfirmed: horses.length > 0 && horses.every((h) => h.umaban != null),
+        horses,
+      } satisfies RaceCard;
+    });
+  } catch {
+    return [];
+  }
+}
+
 // race_days(1日=複数競馬場)を、UI用の日付単位カードデータに畳み込む。
 function toScheduleDays(raceDays: RaceDay[]): ScheduleDay[] {
   const byDate = new Map<string, RaceDay[]>();
@@ -151,9 +222,10 @@ function pickFeatured(): FeatureRace | null {
 }
 
 export default async function Home() {
-  const [raceDays, recentResults] = await Promise.all([
+  const [raceDays, recentResults, raceCards] = await Promise.all([
     getUpcomingRaceDays(),
     getRecentResults(),
+    getRaceCards(),
   ]);
   const days = toScheduleDays(raceDays);
   const featured = pickFeatured();
@@ -187,7 +259,12 @@ export default async function Home() {
       <div className="checker-strip" />
 
       <main className="mx-auto max-w-5xl px-5 py-10 sm:px-8">
-        <ScheduleResults days={days} results={results} resultsAreSample={resultsAreSample} />
+        <ScheduleResults
+          days={days}
+          results={results}
+          resultsAreSample={resultsAreSample}
+          raceCards={raceCards}
+        />
       </main>
 
       <footer style={{ background: "var(--turf-deep)" }}>

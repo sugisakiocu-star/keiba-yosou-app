@@ -56,6 +56,31 @@ export const FEATURE_RACES: FeatureRace[] = [
   },
 ];
 
+// 出馬表(1頭)。枠順確定前は waku/umaban が null。
+export interface EntryHorse {
+  waku: number | null;
+  umaban: number | null;
+  name: string;
+  sexAge: string | null;
+  weightCarry: number | null;
+  jockey: string | null;
+  trainer: string | null;
+}
+
+// 出馬表(1レース)。races + horses から構築する。
+export interface RaceCard {
+  id: string;
+  date: string;
+  dayLabel: string;
+  track: string;
+  raceNo: number;
+  name: string;
+  grade?: Grade;
+  course?: string; // FEATURE_RACES から補完(races には距離/馬場が無いため)
+  gateConfirmed: boolean; // 全馬に馬番が付いていれば枠順確定済み
+  horses: EntryHorse[];
+}
+
 export interface ResultHorse {
   pos: number;
   waku: number;

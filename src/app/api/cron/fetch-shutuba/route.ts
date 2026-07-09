@@ -1,12 +1,60 @@
 import { NextResponse } from "next/server";
-import { fetchRaceCard } from "@/lib/scrape/jra-shutuba";
+import {
+  fetchRaceCard,
+  fetchUpcomingGradedCards,
+  type RaceCard,
+  type Horse,
+} from "@/lib/scrape/jra-shutuba";
 import { getSupabaseAdmin } from "@/lib/supabase-admin";
+import type { SupabaseClient } from "@supabase/supabase-js";
 
 export const dynamic = "force-dynamic";
 
-// 当面のターゲットは今週の七夕賞(2026-07-12・福島・G3)のみ。
-// クエリで上書き可能: ?date=2026-07-12&track=福島&race=七夕賞&debug=1
-const DEFAULT_TARGET = { date: "2026-07-12", track: "福島", raceName: "七夕賞", grade: "G3" };
+// 使い方:
+//  - パラメータ無し(cron): 出馬表インデックスの「今後の重賞」を全て自動取得して upsert する。
+//  - ?date=&track=&race=: 指定した1レースだけ取得(手動/デバッグ用)。例 ?date=2026-07-12&track=福島&race=七夕賞
+// 枠順は開催前々日(金)確定。木曜時点は枠/馬番が空(null)で、金曜に再実行すると埋まる。
+
+// 1レース分(races 1行 + horses N行)を upsert する。書き込んだ頭数を返す。
+async function upsertCard(
+  supabase: SupabaseClient,
+  race: RaceCard,
+  horses: Horse[],
+): Promise<{ horsesWritten: number } | { error: string }> {
+  const { data: raceRow, error: raceErr } = await supabase
+    .from("races")
+    .upsert(
+      {
+        date: race.date,
+        track: race.track,
+        race_no: race.raceNo,
+        name: race.name,
+        grade: race.grade,
+        cname: race.cname,
+      },
+      { onConflict: "date,track,race_no" },
+    )
+    .select("id")
+    .single();
+  if (raceErr) return { error: raceErr.message };
+
+  if (horses.length === 0) return { horsesWritten: 0 };
+  const rows = horses.map((h) => ({
+    race_id: raceRow.id,
+    waku: h.waku,
+    umaban: h.umaban,
+    name: h.name,
+    sex_age: h.sexAge,
+    weight_carry: h.weightCarry,
+    jockey: h.jockey,
+    trainer: h.trainer,
+  }));
+  const { error: horseErr } = await supabase
+    .from("horses")
+    .upsert(rows, { onConflict: "race_id,name" });
+  if (horseErr) return { error: horseErr.message };
+  return { horsesWritten: rows.length };
+}
 
 export async function GET(request: Request) {
   const cronSecret = process.env.CRON_SECRET;
@@ -15,92 +63,87 @@ export async function GET(request: Request) {
   }
 
   const { searchParams } = new URL(request.url);
-  const target = {
-    date: searchParams.get("date") ?? DEFAULT_TARGET.date,
-    track: searchParams.get("track") ?? DEFAULT_TARGET.track,
-    raceName: searchParams.get("race") ?? DEFAULT_TARGET.raceName,
-    grade: searchParams.get("grade") ?? DEFAULT_TARGET.grade,
-    withSample: searchParams.get("debug") === "1",
-  };
+  const date = searchParams.get("date");
+  const race = searchParams.get("race");
 
-  let result;
-  try {
-    result = await fetchRaceCard(target);
-  } catch (e) {
-    return NextResponse.json(
-      { error: e instanceof Error ? e.message : String(e), target },
-      { status: 502 },
-    );
+  // ---- 単レースモード(?date & ?race 指定) ----
+  if (date && race) {
+    const target = {
+      date,
+      track: searchParams.get("track") ?? "",
+      raceName: race,
+      grade: searchParams.get("grade"),
+    };
+    let result;
+    try {
+      result = await fetchRaceCard(target);
+    } catch (e) {
+      return NextResponse.json(
+        { error: e instanceof Error ? e.message : String(e), target },
+        { status: 502 },
+      );
+    }
+    if (!result.found || !result.race) {
+      return NextResponse.json({
+        target,
+        found: false,
+        note: "出馬表が未公開か、目的レースが見つかりませんでした",
+        debug: result.debug,
+      });
+    }
+
+    const supabase = getSupabaseAdmin();
+    if (!supabase) {
+      return NextResponse.json({
+        target,
+        found: true,
+        written: 0,
+        race: result.race,
+        horses: result.horses.length,
+        note: "SUPABASE_SERVICE_ROLE_KEY 未設定のため書き込みをスキップしました",
+      });
+    }
+    const w = await upsertCard(supabase, result.race, result.horses);
+    if ("error" in w) return NextResponse.json({ error: w.error, target }, { status: 500 });
+    return NextResponse.json({
+      mode: "single",
+      race: result.race,
+      horsesWritten: w.horsesWritten,
+    });
   }
 
-  // 出馬表が未公開(目的日がインデックスに出ていない/レースが見つからない)なら書き込まずに状況を返す。
-  if (!result.found || !result.race) {
-    return NextResponse.json({
-      target,
-      found: false,
-      note: "出馬表が未公開か、目的レースが見つかりませんでした(公開は例年 木曜頃)",
-      debug: result.debug,
-    });
+  // ---- cronモード(パラメータ無し): 今後の重賞を全取得 ----
+  let discovered;
+  try {
+    discovered = await fetchUpcomingGradedCards();
+  } catch (e) {
+    return NextResponse.json({ error: e instanceof Error ? e.message : String(e) }, { status: 502 });
   }
 
   const supabase = getSupabaseAdmin();
   if (!supabase) {
     return NextResponse.json({
-      target,
-      found: true,
+      mode: "cron",
+      found: discovered.cards.length,
       written: 0,
-      race: result.race,
-      horses: result.horses.length,
       note: "SUPABASE_SERVICE_ROLE_KEY 未設定のため書き込みをスキップしました",
-      debug: result.debug,
+      races: discovered.cards.map((c) => `${c.race.date} ${c.race.track}${c.race.raceNo}R ${c.race.name}`),
     });
   }
 
-  const { data: raceRow, error: raceErr } = await supabase
-    .from("races")
-    .upsert(
-      {
-        date: result.race.date,
-        track: result.race.track,
-        race_no: result.race.raceNo,
-        name: result.race.name,
-        grade: result.race.grade,
-        cname: result.race.cname,
-      },
-      { onConflict: "date,track,race_no" },
-    )
-    .select("id")
-    .single();
-  if (raceErr) {
-    return NextResponse.json({ error: raceErr.message, target }, { status: 500 });
-  }
-
-  let horsesWritten = 0;
-  if (result.horses.length > 0) {
-    const rows = result.horses.map((h) => ({
-      race_id: raceRow.id,
-      waku: h.waku,
-      umaban: h.umaban,
-      name: h.name,
-      sex_age: h.sexAge,
-      weight_carry: h.weightCarry,
-      jockey: h.jockey,
-      trainer: h.trainer,
-    }));
-    const { error: horseErr } = await supabase
-      .from("horses")
-      .upsert(rows, { onConflict: "race_id,umaban" });
-    if (horseErr) {
-      return NextResponse.json({ error: horseErr.message, target }, { status: 500 });
-    }
-    horsesWritten = rows.length;
+  const written: { race: string; horses: number }[] = [];
+  const errors: { race: string; error: string }[] = [];
+  for (const card of discovered.cards) {
+    const label = `${card.race.date} ${card.race.track}${card.race.raceNo}R ${card.race.name}`;
+    const w = await upsertCard(supabase, card.race, card.horses);
+    if ("error" in w) errors.push({ race: label, error: w.error });
+    else written.push({ race: label, horses: w.horsesWritten });
   }
 
   return NextResponse.json({
-    target,
-    found: true,
-    race: result.race,
-    horsesWritten,
-    debug: result.debug,
+    mode: "cron",
+    discovered: discovered.debug,
+    written,
+    errors,
   });
 }

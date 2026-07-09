@@ -1,21 +1,26 @@
 // JRAの出馬表(出走馬一覧)を取得する。
 //
-// カレンダー日程と違い、出馬表は JRADB の POST フォーム系にある。ページ内の
-//   doAction('/JRADB/accessS.html', '<cname>')
-// を POST(cname=...) で辿る形。cname 末尾の "/AF" 等はチェックサムで計算不可のため、
-// レースIDを組み立てることはできず、必ず出馬表インデックスから親→子とクロールする。
+// カレンダー日程(UTF-8のJSON)と違い、出馬表は JRADB の POST フォーム系にある。ページ内の
+//   doAction('/JRADB/accessD.html', '<cname>')
+// を POST(cname=...) で辿る形。cname 末尾の "/F3" 等はチェックサムで計算不可のため、
+// コードを組み立てることはできず、必ず出馬表インデックスから親→子とクロールする。
 //
-// クロール連鎖:
-//   /keiba/ で出馬表インデックスの cname を取得
-//     → accessS.html にPOST → 出馬表インデックス(開催日ごとの pw01srl... を列挙)
-//       → 目的の開催日を accessS.html にPOST → その日のレース一覧(各レースの pw01ses...)
-//         → 目的レースを accessS.html にPOST → 出馬表(馬名テーブル)
+// ※重要: 出馬表の入口は accessS.html(pw01sli00)ではなく accessD.html(pw01dli00)。
+//   accessS 側(pw01sli00)は「レース結果(成績)」で、過去日しか出てこない。2026-07-09 に判明。
+//
+// クロール連鎖(全段 accessD.html にPOST):
+//   /keiba/ で出馬表インデックスの cname(pw01dli00…)を取得
+//     → 出馬表インデックス(開催日ごとの pw01drl…YYYYMMDD を「N回◯◯M日」ラベル付きで列挙)
+//       → 目的の開催日(date+track一致)ページ → その日のレース一覧(各レース pw01dde…)
+//         → 目的レース(レース名一致)の出馬表テーブル(table.basic.narrow-xy)
 //
 // 注意: JRADB の HTML は Shift_JIS。カレンダーJSON(UTF-8)とは別なので TextDecoder で明示的に変換する。
+// 注意: 枠順は開催前々日(例年 金曜)に確定する。木曜時点は 枠/馬番 が空(=null)で、
+//   馬名・性齢・斤量・騎手・調教師のみ取れる。枠順確定後に再クロールすると同じ連鎖で 枠/馬番 が埋まる。
 
 const USER_AGENT = "keiba-yosou-app (personal study project)";
 const KEIBA_TOP = "https://www.jra.go.jp/keiba/";
-const ACCESS_S = "https://www.jra.go.jp/JRADB/accessS.html";
+const ACCESS_D = "https://www.jra.go.jp/JRADB/accessD.html";
 
 export type RaceCard = {
   date: string; // YYYY-MM-DD
@@ -23,27 +28,31 @@ export type RaceCard = {
   raceNo: number | null;
   name: string;
   grade: string | null;
-  cname: string; // このレースの出馬表 pw01ses コード(再取得・デバッグ用)
+  cname: string; // このレースの出馬表 pw01dde コード(再取得・デバッグ用)
 };
 
 export type Horse = {
-  waku: number | null; // 枠番
-  umaban: number | null; // 馬番
+  waku: number | null; // 枠番(枠順未確定なら null)
+  umaban: number | null; // 馬番(枠順未確定なら null)
   name: string; // 馬名
-  sexAge: string | null; // 性齢 (例: 牡4)
-  weightCarry: number | null; // 斤量
+  sexAge: string | null; // 性齢 (例: 牡5)
+  weightCarry: number | null; // 斤量 (例: 55.0)
   jockey: string | null; // 騎手
   trainer: string | null; // 調教師
 };
 
+const decode = (buf: ArrayBuffer) => new TextDecoder("shift_jis").decode(buf);
+const strip = (s: string) =>
+  s.replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
+
 async function getHtml(url: string): Promise<string> {
   const res = await fetch(url, { headers: { "User-Agent": USER_AGENT }, cache: "no-store" });
   if (!res.ok) throw new Error(`GET failed: ${res.status} ${url}`);
-  return new TextDecoder("shift_jis").decode(await res.arrayBuffer());
+  return decode(await res.arrayBuffer());
 }
 
 async function postJradb(cname: string): Promise<string> {
-  const res = await fetch(ACCESS_S, {
+  const res = await fetch(ACCESS_D, {
     method: "POST",
     headers: {
       "User-Agent": USER_AGENT,
@@ -53,12 +62,12 @@ async function postJradb(cname: string): Promise<string> {
     cache: "no-store",
   });
   if (!res.ok) throw new Error(`POST failed: ${res.status} cname=${cname}`);
-  return new TextDecoder("shift_jis").decode(await res.arrayBuffer());
+  return decode(await res.arrayBuffer());
 }
 
-// doAction('/JRADB/accessS.html','<cname>') から cname を全部取り出す(チェックサム込み)。
-function extractSCnames(html: string): string[] {
-  const re = /doAction\('\/JRADB\/accessS\.html',\s*'([^']+)'\)/g;
+// doAction('/JRADB/accessD.html','<cname>') から cname を全部取り出す(チェックサム込み)。
+function extractDCnames(html: string): string[] {
+  const re = /doAction\('\/JRADB\/accessD\.html',\s*'([^']+)'\)/g;
   const out: string[] = [];
   for (const m of html.matchAll(re)) out.push(m[1]);
   return out;
@@ -67,53 +76,131 @@ function extractSCnames(html: string): string[] {
 // 出馬表インデックスの入口 cname を /keiba/ から取得する(チェックサムをハードコードしないため)。
 async function fetchIndexCname(): Promise<string> {
   const html = await getHtml(KEIBA_TOP);
-  const cname = extractSCnames(html).find((c) => c.startsWith("pw01sli00"));
-  if (!cname) throw new Error("出馬表インデックスの cname(pw01sli00) が /keiba/ に見つからない");
+  const cname = extractDCnames(html).find((c) => c.startsWith("pw01dli00"));
+  if (!cname) throw new Error("出馬表インデックスの cname(pw01dli00) が /keiba/ に見つからない");
   return cname;
 }
 
-type DayLink = { cname: string; date: string };
+export type DayLink = {
+  cname: string;
+  date: string; // YYYY-MM-DD
+  track: string | null; // 競馬場名(ラベル「N回◯◯M日」から抽出)
+  kai: number | null; // 開催回
+  nichi: number | null; // 開催何日目
+};
 
-// 出馬表インデックスHTMLから、開催日ごとのリンク(pw01srl...YYYYMMDD/CK)を取り出す。
-// コード末尾8桁が開催日なので、そこから日付を復元する(HTML構造に依存しない堅い抽出)。
-export function parseDayLinks(indexHtml: string): DayLink[] {
-  const re = /pw01srl\d{12}(\d{8})\/[0-9A-F]{2}/g;
+// 出馬表インデックス/開催日ページから、開催日ごとのリンク(pw01drl…YYYYMMDD/CK)を
+// ラベル「N回◯◯M日」付きで取り出す。コード末尾8桁が開催日。
+export function parseDayLinks(html: string): DayLink[] {
+  // アンカーごとに cname とラベルを対応付ける。
+  const re =
+    /doAction\('\/JRADB\/accessD\.html',\s*'(pw01drl\d{12}(\d{8})\/[0-9A-F]{2})'\)[\s\S]*?>([\s\S]*?)<\/a>/g;
   const seen = new Set<string>();
   const out: DayLink[] = [];
-  for (const m of indexHtml.matchAll(re)) {
-    const cname = m[0];
+  for (const m of html.matchAll(re)) {
+    const cname = m[1];
     if (seen.has(cname)) continue;
     seen.add(cname);
-    const d = m[1];
-    out.push({ cname, date: `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}` });
+    const d = m[2];
+    const label = strip(m[3]); // 例: "2回福島6日"
+    const lm = label.match(/(\d+)回(\D+?)(\d+)日/);
+    out.push({
+      cname,
+      date: `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`,
+      track: lm ? lm[2] : null,
+      kai: lm ? Number(lm[1]) : null,
+      nichi: lm ? Number(lm[3]) : null,
+    });
   }
   return out;
 }
 
-// --- ここから下(開催日リスト/馬名テーブルの解析)は 2026-07-09 の出馬表公開後に実物で確定する ---
-// 過去日を叩くと成績ページに飛ぶため、公開前は構造を最終確定できない。暫定実装＋TODO。
+export type RaceLink = {
+  cname: string;
+  raceNo: number | null;
+  name: string | null;
+  grade: string | null;
+};
 
-type RaceLink = { cname: string; raceNo: number | null; name: string | null };
+// icon_grade_s_g3.png / icon_grade_j_g1.png → "G3" / "J.G1"
+function gradeFromIcon(html: string): string | null {
+  const m = html.match(/icon_grade_(s|j)_g(\d)/);
+  if (!m) return null;
+  return m[1] === "j" ? `J.G${m[2]}` : `G${m[2]}`;
+}
 
-// その日のレース一覧HTMLから、各レースの出馬表リンク(pw01ses...)を取り出す。
-// TODO(2026-07-09): 実ページでレース番号・レース名の対応付けを確定する。
+// その日のレース一覧HTMLから、各レースの出馬表リンク(pw01dde…)を
+// レース番号・レース名・グレード付きで取り出す。
+// レース番号は dde コードに埋まる: pw01dde + 12桁 + RR(2桁=レース番号) + 8桁(日付)。
+// レースリンクは doAction ではなく直リンク href="/JRADB/accessD.html?CNAME=pw01dde…" の形。
+// 1レース = テーブル1行(<tr>)。行内に th.race_num(ddeリンク) と td.race_name(名前+グレード)がある。
 export function parseRaceLinks(dayHtml: string): RaceLink[] {
-  const re = /pw01ses\d+\/[0-9A-F]{2}/g;
   const seen = new Set<string>();
   const out: RaceLink[] = [];
-  for (const m of dayHtml.matchAll(re)) {
-    const cname = m[0];
+  for (const rm of dayHtml.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)) {
+    const row = rm[1];
+    const cm = row.match(/CNAME=(pw01dde\d{12}(\d{2})\d{8}\/[0-9A-F]{2})/);
+    if (!cm) continue;
+    const cname = cm[1];
     if (seen.has(cname)) continue;
     seen.add(cname);
-    out.push({ cname, raceNo: null, name: null });
+    // race_name セルの先頭テキスト(グレードアイコン以降を落とす)をレース名とする。
+    const nameCell = row.match(/class="race_name">([\s\S]*?)<\/td>/);
+    let name: string | null = null;
+    if (nameCell) name = strip(nameCell[1].replace(/<span class="grade_icon[\s\S]*/, "")) || null;
+    out.push({ cname, raceNo: Number(cm[2]), name, grade: gradeFromIcon(row) });
   }
   return out;
 }
 
-// 出馬表(馬名テーブル)HTMLから出走馬を取り出す。
-// TODO(2026-07-09): 実ページのテーブル構造(枠/馬番/馬名/性齢/斤量/騎手/調教師)に合わせて確定する。
-export function parseHorses(_shutubaHtml: string): Horse[] {
-  return [];
+// 出馬表(馬名テーブル table.basic.narrow-xy)HTMLから出走馬を取り出す。
+export function parseHorses(shutubaHtml: string): Horse[] {
+  const start = shutubaHtml.indexOf('class="basic narrow-xy');
+  if (start < 0) return [];
+  const tbl = shutubaHtml.slice(start, shutubaHtml.indexOf("</table>", start));
+  const rows = [...tbl.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)].map((m) => m[1]);
+
+  const cell = (row: string, cls: string): string => {
+    const m = row.match(new RegExp(`<td[^>]*class="${cls}[^"]*"[^>]*>([\\s\\S]*?)</td>`));
+    return m ? m[1] : "";
+  };
+  const pick = (chunk: string, re: RegExp): string => strip((chunk.match(re) ?? [])[1] ?? "");
+  const toInt = (s: string): number | null => {
+    const m = s.match(/\d+/);
+    return m ? Number(m[0]) : null;
+  };
+  const toNum = (s: string): number | null => {
+    const m = s.match(/\d+(?:\.\d+)?/);
+    return m ? Number(m[0]) : null;
+  };
+
+  const horses: Horse[] = [];
+  for (const row of rows) {
+    if (!/<td[^>]*class="waku/.test(row)) continue; // データ行のみ(ヘッダ除外)
+    const horseTd = cell(row, "horse");
+    const jockeyTd = cell(row, "jockey");
+
+    const name = pick(horseTd, /<div class="name">([\s\S]*?)<\/div>/);
+    if (!name) continue;
+    const trainerRaw = pick(horseTd, /<p class="trainer">([\s\S]*?)<\/p>/);
+    const trainer = trainerRaw.replace(/[(（].*$/, "").trim() || null; // 所属(美浦/栗東)を落とす
+
+    const sexColor = pick(jockeyTd, /<p class="age">([\s\S]*?)<\/p>/); // 例: 牡5/青鹿
+    const sexAge = sexColor ? sexColor.split("/")[0].trim() : null; // 例: 牡5
+    const weightCarry = toNum(pick(jockeyTd, /<p class="weight">([\s\S]*?)<\/p>/));
+    const jockey = pick(jockeyTd, /<p class="jockey">([\s\S]*?)<\/p>/) || null;
+
+    horses.push({
+      waku: toInt(strip(cell(row, "waku"))),
+      umaban: toInt(strip(cell(row, "num"))),
+      name,
+      sexAge,
+      weightCarry,
+      jockey,
+      trainer,
+    });
+  }
+  return horses;
 }
 
 export type FetchRaceCardResult = {
@@ -124,54 +211,100 @@ export type FetchRaceCardResult = {
     dayCandidates: DayLink[];
     matchedDayCname: string | null;
     raceLinks: number;
+    matchedRaceCname: string | null;
     horsesParsed: number;
-    // 7/9 の実物確認用に、たどり着いた各段HTMLの断片を返す。
-    sampleHtml?: string;
   };
 };
 
-// 指定した開催日・レース名の出馬表をクロールして取得する。
+// 指定した開催日・競馬場・レース名の出馬表をクロールして取得する。
 export async function fetchRaceCard(target: {
   date: string; // YYYY-MM-DD
   track: string;
   raceName: string; // 部分一致で照合(例: 七夕賞)
   grade?: string | null;
-  withSample?: boolean;
 }): Promise<FetchRaceCardResult> {
   const indexCname = await fetchIndexCname();
   const indexHtml = await postJradb(indexCname);
-  const dayCandidates = parseDayLinks(indexHtml).filter((d) => d.date === target.date);
+  const allDays = parseDayLinks(indexHtml);
+  // date 一致、かつ track 一致(ラベル未取得なら date だけで候補に残す)。
+  const dayCandidates = allDays.filter(
+    (d) => d.date === target.date && (d.track === null || d.track.includes(target.track)),
+  );
 
   const debug: FetchRaceCardResult["debug"] = {
     dayCandidates,
     matchedDayCname: null,
     raceLinks: 0,
+    matchedRaceCname: null,
     horsesParsed: 0,
   };
 
-  // 目的日の候補(複数開催)を順に開き、レース名が一致する開催日ページを特定する。
   for (const day of dayCandidates) {
     const dayHtml = await postJradb(day.cname);
-    if (!dayHtml.includes(target.raceName)) continue;
-    debug.matchedDayCname = day.cname;
-
     const raceLinks = parseRaceLinks(dayHtml);
-    debug.raceLinks = raceLinks.length;
-    if (target.withSample) debug.sampleHtml = dayHtml.slice(0, 4000);
+    const race = raceLinks.find((r) => r.name && r.name.includes(target.raceName));
+    if (!race) continue;
 
-    // TODO(2026-07-09): レース名でレースを特定できるようになったら、該当 ses を選んで出馬表を取得する。
-    // 現状は暫定: 出馬表の実HTMLは公開後に確定するため、レース枠だけ返す。
-    const race: RaceCard = {
-      date: target.date,
-      track: target.track,
-      raceNo: null,
-      name: target.raceName,
-      grade: target.grade ?? null,
-      cname: raceLinks[0]?.cname ?? day.cname,
+    debug.matchedDayCname = day.cname;
+    debug.raceLinks = raceLinks.length;
+    debug.matchedRaceCname = race.cname;
+
+    const shutubaHtml = await postJradb(race.cname);
+    const horses = parseHorses(shutubaHtml);
+    debug.horsesParsed = horses.length;
+
+    return {
+      found: horses.length > 0,
+      race: {
+        date: target.date,
+        track: target.track,
+        raceNo: race.raceNo,
+        name: race.name ?? target.raceName,
+        grade: race.grade ?? target.grade ?? null,
+        cname: race.cname,
+      },
+      horses,
+      debug,
     };
-    return { found: true, race, horses: [], debug };
   }
 
-  if (target.withSample) debug.sampleHtml = indexHtml.slice(0, 4000);
   return { found: false, race: null, horses: [], debug };
+}
+
+export type GradedCard = { race: RaceCard; horses: Horse[] };
+
+// 出馬表インデックスに出ている「今後の重賞」を全て自動収集する(週次cron用)。
+// 各開催日ページはレース一覧をグレード付きで返すので、重賞(grade!=null)だけ出馬表テーブルを取りに行く。
+// リクエスト数は有界: index(1) + 開催日ページ(数日) + 重賞の出馬表(数レース)。
+export async function fetchUpcomingGradedCards(opts?: { fromDate?: string }): Promise<{
+  cards: GradedCard[];
+  debug: { days: number; graded: number };
+}> {
+  const fromDate = opts?.fromDate ?? new Date().toISOString().slice(0, 10);
+  const indexCname = await fetchIndexCname();
+  const indexHtml = await postJradb(indexCname);
+  const days = parseDayLinks(indexHtml).filter((d) => d.date >= fromDate);
+
+  const cards: GradedCard[] = [];
+  for (const day of days) {
+    const dayHtml = await postJradb(day.cname);
+    const gradedRaces = parseRaceLinks(dayHtml).filter((r) => r.grade); // 重賞のみ
+    for (const race of gradedRaces) {
+      const shutubaHtml = await postJradb(race.cname);
+      const horses = parseHorses(shutubaHtml);
+      if (horses.length === 0) continue; // 未公開などで空なら書き込まない
+      cards.push({
+        race: {
+          date: day.date,
+          track: day.track ?? "",
+          raceNo: race.raceNo,
+          name: race.name ?? "",
+          grade: race.grade,
+          cname: race.cname,
+        },
+        horses,
+      });
+    }
+  }
+  return { cards, debug: { days: days.length, graded: cards.length } };
 }
