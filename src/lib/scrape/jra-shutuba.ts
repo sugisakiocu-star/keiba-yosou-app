@@ -28,7 +28,34 @@ export type RaceCard = {
   raceNo: number | null;
   name: string;
   grade: string | null;
+  distance: number | null; // 距離(メートル)。出馬表ヘッダ「コース:2,000メートル(芝・右)」から
+  surface: string | null; // 芝/ダート/障
   cname: string; // このレースの出馬表 pw01dde コード(再取得・デバッグ用)
+};
+
+// 出馬表 td.past p1〜p4 に埋まっている過去走(1走分)。追加リクエストゼロで取れる。
+export type PastRun = {
+  date: string | null; // YYYY-MM-DD
+  track: string | null; // 例: 中山
+  raceName: string | null;
+  grade: string | null; // G1/G2/G3/J.G* 。平場・リステッドは null
+  place: number | null; // 着順。中止/除外などは null
+  placeText: string | null; // 生の着順表記 (例: "10着", "中止")
+  fieldSize: number | null; // 頭数
+  umaban: number | null; // 馬番
+  popularity: number | null; // 人気
+  jockey: string | null;
+  weightCarry: number | null; // 斤量
+  distance: number | null; // 距離(メートル)
+  surface: string | null; // 芝/ダート/障
+  time: string | null; // 走破タイム (例: "2:32.3")
+  going: string | null; // 馬場状態 (良/稍重/重/不良)
+  rating: number | null; // JRAレーティング
+  horseWeight: number | null; // 馬体重
+  corners: string | null; // コーナー通過順 (例: "2-2-2-1")
+  last3f: number | null; // 上がり3F (例: 37.5)
+  finHorse: string | null; // 勝ち馬(自身が1着なら2着馬)
+  finDiff: number | null; // 着差(秒)。自身が1着なら負値のことがある
 };
 
 export type Horse = {
@@ -39,11 +66,21 @@ export type Horse = {
   weightCarry: number | null; // 斤量 (例: 55.0)
   jockey: string | null; // 騎手
   trainer: string | null; // 調教師
+  past: PastRun[]; // 過去4走(最新順。キャリアが浅い馬は4未満)
 };
 
 const decode = (buf: ArrayBuffer) => new TextDecoder("shift_jis").decode(buf);
 const strip = (s: string) =>
   s.replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
+const toInt = (s: string): number | null => {
+  const m = s.match(/\d+/);
+  return m ? Number(m[0]) : null;
+};
+const toNum = (s: string): number | null => {
+  const m = s.match(/\d+(?:\.\d+)?/);
+  return m ? Number(m[0]) : null;
+};
+const pick = (chunk: string, re: RegExp): string => strip((chunk.match(re) ?? [])[1] ?? "");
 
 async function getHtml(url: string): Promise<string> {
   const res = await fetch(url, { headers: { "User-Agent": USER_AGENT }, cache: "no-store" });
@@ -153,6 +190,56 @@ export function parseRaceLinks(dayHtml: string): RaceLink[] {
   return out;
 }
 
+// 出馬表ヘッダの「コース:2,000メートル(芝・右)」から距離と芝ダを取り出す。
+export function parseCourse(shutubaHtml: string): { distance: number | null; surface: string | null } {
+  const m = shutubaHtml.match(/class="cell course"[^>]*>([\s\S]*?)<\/div>/);
+  if (!m) return { distance: null, surface: null };
+  const txt = strip(m[1]).replace(/,/g, "");
+  const surface = txt.includes("障") ? "障" : txt.includes("ダート") ? "ダート" : txt.includes("芝") ? "芝" : null;
+  return { distance: toInt(txt), surface };
+}
+
+// 過去走セル(td.past p1〜p4)1つ分をパースする。キャリアが浅い馬の空セルは null。
+function parsePastCell(td: string): PastRun | null {
+  const raceName = pick(td, /<div class="name">([\s\S]*?)<\/div>/) || null;
+  const dateM = pick(td, /<div class="date">([\s\S]*?)<\/div>/).match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
+  if (!raceName && !dateM) return null;
+
+  const placeText = pick(td, /<div class="place">([\s\S]*?)<\/div>/) || null;
+  const placeM = placeText?.match(/^(\d+)着/);
+  // 距離表記は "2500芝" / "1200ダ" / "3000障" 形式
+  const distRaw = pick(td, /<span class="dist">([\s\S]*?)<\/span>/);
+  const surfChar = distRaw.match(/(芝|ダ|障)/)?.[1] ?? null;
+  const finM = td.match(/<p class="fin">([\s\S]*?)<\/p>/);
+  const finDiffM = finM?.[1].match(/\(([-−+]?\d+(?:\.\d+)?)\)/);
+
+  return {
+    date: dateM ? `${dateM[1]}-${dateM[2].padStart(2, "0")}-${dateM[3].padStart(2, "0")}` : null,
+    track: pick(td, /<div class="rc">([\s\S]*?)<\/div>/) || null,
+    raceName,
+    grade: gradeFromIcon(td),
+    place: placeM ? Number(placeM[1]) : null,
+    placeText,
+    fieldSize: toInt(pick(td, /<span class="max">([\s\S]*?)<\/span>/)),
+    umaban: toInt(pick(td, /<span class="gate">([\s\S]*?)<\/span>/)),
+    popularity: toInt(pick(td, /<span class="pop">([\s\S]*?)<\/span>/)),
+    jockey: pick(td, /<div class="jockey">([\s\S]*?)<\/div>/) || null,
+    weightCarry: toNum(pick(td, /<div class="weight">([\s\S]*?)<\/div>/)),
+    distance: toInt(distRaw.replace(/,/g, "")),
+    surface: surfChar === "ダ" ? "ダート" : surfChar, // result_horses の表記(芝/ダート/障)に揃える
+    time: pick(td, /<p class="time">([\s\S]*?)<\/p>/) || null,
+    going: pick(td, /<span class="condition">([\s\S]*?)<\/span>/) || null,
+    rating: toInt(pick(td, /<p class="rating">([\s\S]*?)<\/p>/)),
+    horseWeight: toInt(pick(td, /<p class="h_weight">([\s\S]*?)<\/p>/)),
+    corners:
+      [...td.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/g)].map((m) => strip(m[1])).filter(Boolean).join("-") ||
+      null,
+    last3f: toNum(pick(td, /<div class="f3">([\s\S]*?)<\/div>/).replace(/^3F\s*/, "")),
+    finHorse: finM ? strip(finM[1].replace(/<span class="time">[\s\S]*$/, "")) || null : null,
+    finDiff: finDiffM ? Number(finDiffM[1].replace("−", "-")) : null,
+  };
+}
+
 // 出馬表(馬名テーブル table.basic.narrow-xy)HTMLから出走馬を取り出す。
 export function parseHorses(shutubaHtml: string): Horse[] {
   const start = shutubaHtml.indexOf('class="basic narrow-xy');
@@ -163,15 +250,6 @@ export function parseHorses(shutubaHtml: string): Horse[] {
   const cell = (row: string, cls: string): string => {
     const m = row.match(new RegExp(`<td[^>]*class="${cls}[^"]*"[^>]*>([\\s\\S]*?)</td>`));
     return m ? m[1] : "";
-  };
-  const pick = (chunk: string, re: RegExp): string => strip((chunk.match(re) ?? [])[1] ?? "");
-  const toInt = (s: string): number | null => {
-    const m = s.match(/\d+/);
-    return m ? Number(m[0]) : null;
-  };
-  const toNum = (s: string): number | null => {
-    const m = s.match(/\d+(?:\.\d+)?/);
-    return m ? Number(m[0]) : null;
   };
 
   const horses: Horse[] = [];
@@ -190,6 +268,12 @@ export function parseHorses(shutubaHtml: string): Horse[] {
     const weightCarry = toNum(pick(jockeyTd, /<p class="weight">([\s\S]*?)<\/p>/));
     const jockey = pick(jockeyTd, /<p class="jockey">([\s\S]*?)<\/p>/) || null;
 
+    // 過去4走(td.past p1〜p4)。p1が前走。キャリアが浅い馬は空セルなので詰める。
+    // 3着以内のセルは class="past p1 place1" のように修飾クラスが付くので [^"]* で許容する。
+    const past = [...row.matchAll(/<td[^>]*class="past p\d[^"]*"[^>]*>([\s\S]*?)<\/td>/g)]
+      .map((m) => parsePastCell(m[1]))
+      .filter((p): p is PastRun => p != null);
+
     horses.push({
       waku: toInt(strip(cell(row, "waku"))),
       umaban: toInt(strip(cell(row, "num"))),
@@ -198,6 +282,7 @@ export function parseHorses(shutubaHtml: string): Horse[] {
       weightCarry,
       jockey,
       trainer,
+      past,
     });
   }
   return horses;
@@ -251,6 +336,7 @@ export async function fetchRaceCard(target: {
 
     const shutubaHtml = await postJradb(race.cname);
     const horses = parseHorses(shutubaHtml);
+    const course = parseCourse(shutubaHtml);
     debug.horsesParsed = horses.length;
 
     return {
@@ -261,6 +347,8 @@ export async function fetchRaceCard(target: {
         raceNo: race.raceNo,
         name: race.name ?? target.raceName,
         grade: race.grade ?? target.grade ?? null,
+        distance: course.distance,
+        surface: course.surface,
         cname: race.cname,
       },
       horses,
@@ -293,6 +381,7 @@ export async function fetchUpcomingGradedCards(opts?: { fromDate?: string }): Pr
       const shutubaHtml = await postJradb(race.cname);
       const horses = parseHorses(shutubaHtml);
       if (horses.length === 0) continue; // 未公開などで空なら書き込まない
+      const course = parseCourse(shutubaHtml);
       cards.push({
         race: {
           date: day.date,
@@ -300,6 +389,8 @@ export async function fetchUpcomingGradedCards(opts?: { fromDate?: string }): Pr
           raceNo: race.raceNo,
           name: race.name ?? "",
           grade: race.grade,
+          distance: course.distance,
+          surface: course.surface,
           cname: race.cname,
         },
         horses,

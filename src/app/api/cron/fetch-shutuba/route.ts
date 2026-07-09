@@ -15,30 +15,39 @@ export const dynamic = "force-dynamic";
 //  - ?date=&track=&race=: 指定した1レースだけ取得(手動/デバッグ用)。例 ?date=2026-07-12&track=福島&race=七夕賞
 // 枠順は開催前々日(金)確定。木曜時点は枠/馬番が空(null)で、金曜に再実行すると埋まる。
 
-// 1レース分(races 1行 + horses N行)を upsert する。書き込んだ頭数を返す。
+// 1レース分(races 1行 + horses N行 + 過去4走)を upsert する。書き込んだ件数を返す。
 async function upsertCard(
   supabase: SupabaseClient,
   race: RaceCard,
   horses: Horse[],
-): Promise<{ horsesWritten: number } | { error: string }> {
-  const { data: raceRow, error: raceErr } = await supabase
+): Promise<{ horsesWritten: number; pastRunsWritten: number; pastRunsNote?: string } | { error: string }> {
+  const raceBase = {
+    date: race.date,
+    track: race.track,
+    race_no: race.raceNo,
+    name: race.name,
+    grade: race.grade,
+    cname: race.cname,
+  };
+  let { data: raceRow, error: raceErr } = await supabase
     .from("races")
     .upsert(
-      {
-        date: race.date,
-        track: race.track,
-        race_no: race.raceNo,
-        name: race.name,
-        grade: race.grade,
-        cname: race.cname,
-      },
+      { ...raceBase, distance: race.distance, surface: race.surface },
       { onConflict: "date,track,race_no" },
     )
     .select("id")
     .single();
-  if (raceErr) return { error: raceErr.message };
+  // distance/surface 列が未適用(schema.sql の4Aセクション実行前)のDBでは旧カラム構成で書く。
+  if (raceErr?.message.includes("column")) {
+    ({ data: raceRow, error: raceErr } = await supabase
+      .from("races")
+      .upsert(raceBase, { onConflict: "date,track,race_no" })
+      .select("id")
+      .single());
+  }
+  if (raceErr || !raceRow) return { error: raceErr?.message ?? "races upsert failed" };
 
-  if (horses.length === 0) return { horsesWritten: 0 };
+  if (horses.length === 0) return { horsesWritten: 0, pastRunsWritten: 0 };
   const rows = horses.map((h) => ({
     race_id: raceRow.id,
     waku: h.waku,
@@ -49,11 +58,52 @@ async function upsertCard(
     jockey: h.jockey,
     trainer: h.trainer,
   }));
-  const { error: horseErr } = await supabase
+  const { data: horseRows, error: horseErr } = await supabase
     .from("horses")
-    .upsert(rows, { onConflict: "race_id,name" });
+    .upsert(rows, { onConflict: "race_id,name" })
+    .select("id, name");
   if (horseErr) return { error: horseErr.message };
-  return { horsesWritten: rows.length };
+
+  // 過去4走(フェーズ4A)。horses のIDに紐付けて upsert。
+  const idByName = new Map((horseRows ?? []).map((r) => [r.name as string, r.id as number]));
+  const pastRows = horses.flatMap((h) => {
+    const horseId = idByName.get(h.name);
+    if (horseId == null) return [];
+    return h.past.map((p, i) => ({
+      horse_id: horseId,
+      run_no: i + 1,
+      date: p.date,
+      track: p.track,
+      race_name: p.raceName,
+      grade: p.grade,
+      place: p.place,
+      place_text: p.placeText,
+      field_size: p.fieldSize,
+      umaban: p.umaban,
+      popularity: p.popularity,
+      jockey: p.jockey,
+      weight_carry: p.weightCarry,
+      distance: p.distance,
+      surface: p.surface,
+      time: p.time,
+      going: p.going,
+      rating: p.rating,
+      horse_weight: p.horseWeight,
+      corners: p.corners,
+      last3f: p.last3f,
+      fin_horse: p.finHorse,
+      fin_diff: p.finDiff,
+    }));
+  });
+  if (pastRows.length === 0) return { horsesWritten: rows.length, pastRunsWritten: 0 };
+  const { error: pastErr } = await supabase
+    .from("horse_past_runs")
+    .upsert(pastRows, { onConflict: "horse_id,run_no" });
+  if (pastErr) {
+    // テーブル未適用(schema.sql の4AセクションをSQL Editorで実行前)でも出馬表本体は成功扱いにする。
+    return { horsesWritten: rows.length, pastRunsWritten: 0, pastRunsNote: pastErr.message };
+  }
+  return { horsesWritten: rows.length, pastRunsWritten: pastRows.length };
 }
 
 export async function GET(request: Request) {
@@ -109,6 +159,8 @@ export async function GET(request: Request) {
       mode: "single",
       race: result.race,
       horsesWritten: w.horsesWritten,
+      pastRunsWritten: w.pastRunsWritten,
+      ...(w.pastRunsNote ? { pastRunsNote: w.pastRunsNote } : {}),
     });
   }
 
@@ -131,13 +183,19 @@ export async function GET(request: Request) {
     });
   }
 
-  const written: { race: string; horses: number }[] = [];
+  const written: { race: string; horses: number; pastRuns: number; note?: string }[] = [];
   const errors: { race: string; error: string }[] = [];
   for (const card of discovered.cards) {
     const label = `${card.race.date} ${card.race.track}${card.race.raceNo}R ${card.race.name}`;
     const w = await upsertCard(supabase, card.race, card.horses);
     if ("error" in w) errors.push({ race: label, error: w.error });
-    else written.push({ race: label, horses: w.horsesWritten });
+    else
+      written.push({
+        race: label,
+        horses: w.horsesWritten,
+        pastRuns: w.pastRunsWritten,
+        ...(w.pastRunsNote ? { note: w.pastRunsNote } : {}),
+      });
   }
 
   return NextResponse.json({

@@ -44,6 +44,20 @@ type HistRow = {
 type JockeyRow = { jockey: string | null; place: number | null };
 
 const MARKS = ["◎", "○", "▲", "△", "△"];
+const PAGE_SIZE = 1000; // Supabase の max-rows 上限。超える分は range() でページングして全件読む
+
+// makeQuery が返すクエリを range() で繰り返し実行して全行を集める。失敗したら null。
+async function fetchAllRows<T>(
+  makeQuery: (from: number, to: number) => PromiseLike<{ data: T[] | null; error: unknown }>,
+): Promise<T[] | null> {
+  const out: T[] = [];
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await makeQuery(from, from + PAGE_SIZE - 1);
+    if (error) return null;
+    out.push(...(data ?? []));
+    if ((data?.length ?? 0) < PAGE_SIZE) return out;
+  }
+}
 const GRADE_W: Record<string, number> = { G1: 1.5, G2: 1.2, G3: 1.0 };
 
 const placePts = (p: number | null): number =>
@@ -98,16 +112,28 @@ export async function buildPredictions(cards: RaceCard[]): Promise<RacePredictio
   let jhist: JockeyRow[] = [];
   try {
     const supabase = createClient(url, anonKey);
+    // id 順 + range() でページングしないと max-rows(1000行)で切られる
     const [h, j] = await Promise.all([
-      supabase
-        .from("result_horses")
-        .select("name, place, race_results(date, grade, surface, distance)")
-        .in("name", allNames),
-      supabase.from("result_horses").select("jockey, place").in("jockey", allJockeys).limit(10000),
+      fetchAllRows((from, to) =>
+        supabase
+          .from("result_horses")
+          .select("name, place, race_results(date, grade, surface, distance)")
+          .in("name", allNames)
+          .order("id")
+          .range(from, to),
+      ),
+      fetchAllRows<JockeyRow>((from, to) =>
+        supabase
+          .from("result_horses")
+          .select("jockey, place")
+          .in("jockey", allJockeys)
+          .order("id")
+          .range(from, to),
+      ),
     ]);
-    if (h.error || j.error) return [];
-    hist = (h.data ?? []) as unknown as HistRow[];
-    jhist = (j.data ?? []) as JockeyRow[];
+    if (h == null || j == null) return [];
+    hist = h as unknown as HistRow[];
+    jhist = j;
   } catch {
     return [];
   }
