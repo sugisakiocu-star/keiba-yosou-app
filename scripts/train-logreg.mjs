@@ -150,6 +150,7 @@ for (const [rid, list] of byRace) {
 const byHorse = new Map();
 const byJockey = new Map();
 const byTrainer = new Map();
+const byTrainerTrack = new Map(); // key: `${trainer}|${track}`
 for (const h of rows) {
   const meta = raceById.get(h.result_id);
   if (!meta) continue;
@@ -170,10 +171,13 @@ for (const h of rows) {
   if (h.trainer) {
     if (!byTrainer.has(h.trainer)) byTrainer.set(h.trainer, []);
     byTrainer.get(h.trainer).push({ date: meta.date, top3: h.place != null && h.place <= 3 ? 1 : 0 });
+    const tt = `${h.trainer}|${meta.track}`;
+    if (!byTrainerTrack.has(tt)) byTrainerTrack.set(tt, []);
+    byTrainerTrack.get(tt).push({ date: meta.date, top3: h.place != null && h.place <= 3 ? 1 : 0 });
   }
 }
 for (const list of byHorse.values()) list.sort((a, b) => (a.date < b.date ? -1 : 1));
-for (const list of [...byJockey.values(), ...byTrainer.values()]) {
+for (const list of [...byJockey.values(), ...byTrainer.values(), ...byTrainerTrack.values()]) {
   list.sort((a, b) => (a.date < b.date ? -1 : 1));
   let acc = 0;
   for (const r of list) {
@@ -199,6 +203,11 @@ const jockeyStats = (jockey, date) => {
 };
 const trainerStats = (trainer, date) => {
   const list = byTrainer.get(trainer) ?? [];
+  const n = cutIdx(list, date);
+  return { n, top3: n > 0 ? list[n - 1].cum : 0 };
+};
+const trainerTrackStats = (trainer, track, date) => {
+  const list = byTrainerTrack.get(`${trainer}|${track}`) ?? [];
   const n = cutIdx(list, date);
   return { n, top3: n > 0 ? list[n - 1].cum : 0 };
 };
@@ -236,6 +245,9 @@ const FEATURES = [
   "classUp", // 昇級初戦ダミー(今日のクラス重み>前走)
   "femaleD", // 牝馬ダミー
   "age", // 年齢
+  // ---- 4J追加: 残りのゼロクロール候補 ----
+  "trainerTrackRate", // 調教師×競馬場の複勝率(当日まで、5出走未満は学習全体平均)。滞在競馬・得意場の指標
+  "layoffRunNo", // 休養明け(90日以上の間隔)から何戦目か(1=休み明け初戦、上限6)。叩き良化型の指標
 ];
 if (WITH_POP) FEATURES.push("popLog"); // log(人気)。市場のレース前評価(発走前に既知なのでリークではない)
 const toNumSafe = (s) => {
@@ -303,6 +315,22 @@ function buildFeatures(h, race, avgW) {
   // ---- 4I ----
   const ts = trainerStats(h.trainer, race.date);
   f.trainerRate = ts.n >= 5 ? ts.top3 / ts.n : NaN; // NaN→後で学習平均で埋める
+  // ---- 4J ----
+  const tts = trainerTrackStats(h.trainer, race.track, race.date);
+  f.trainerTrackRate = tts.n >= 5 ? tts.top3 / tts.n : NaN; // NaN→後で学習平均で埋める
+  if (runs.length > 0) {
+    // 休養明けから何戦目か: 今日を1戦目として、90日以上の間隔が出るまで遡って数える
+    const ds = [...runs.map((r) => r.date), race.date];
+    let runNo = 1;
+    for (let i = ds.length - 1; i >= 1 && runNo < 6; i--) {
+      const gap = (new Date(ds[i]).getTime() - new Date(ds[i - 1]).getTime()) / (1000 * 3600 * 24);
+      if (gap >= 90) break;
+      runNo++;
+    }
+    f.layoffRunNo = runNo;
+  } else {
+    f.layoffRunNo = 1; // 初出走はdebutダミーが担当
+  }
   if (runs.length > 0) {
     const placed4 = last4.filter((r) => r.place != null && r.fieldSize != null && r.fieldSize > 1);
     let pct = 0;
@@ -383,8 +411,8 @@ if (WITH_POP)
   for (const s of [...trainRaces, ...testRaces])
     for (const e of s.entrants) e.f.popLog = Math.log(popProb(e.h.popularity));
 
-// jockeyRate/trainerRate の NaN を学習全体平均で埋める+標準化(平均0/分散1、学習セットの統計のみ使用)
-for (const key of ["jockeyRate", "trainerRate"]) {
+// レート系のNaNを学習全体平均で埋める+標準化(平均0/分散1、学習セットの統計のみ使用)
+for (const key of ["jockeyRate", "trainerRate", "trainerTrackRate"]) {
   const vals = trainRaces.flatMap((s) => s.entrants.map((e) => e.f[key])).filter((v) => !Number.isNaN(v));
   const m = vals.reduce((a, b) => a + b, 0) / Math.max(vals.length, 1);
   for (const s of [...trainRaces, ...testRaces])
