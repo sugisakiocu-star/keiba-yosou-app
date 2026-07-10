@@ -79,34 +79,43 @@ export function parsePayouts(html) {
 }
 
 // ---- メイン ----
-const { data: races, error } = await supabase
-  .from("race_results")
-  .select("id, date, track, name, grade, cname")
-  .order("date");
-if (error) {
-  console.error(error);
-  process.exit(1);
-}
-const targets = races.filter((r) => r.grade && !r.grade.startsWith("J") && r.cname);
-
-let store = {};
-if (fs.existsSync(OUT)) store = JSON.parse(fs.readFileSync(OUT, "utf-8"));
-
-let done = 0;
-for (const r of targets) {
-  if (done >= LIMIT) break;
-  if (SKIP_EXISTING && store[r.id]) continue;
-  const html = await getResultHtml(r.cname);
-  const payouts = parsePayouts(html);
-  if (!payouts || !payouts.win?.length) {
-    console.warn(`⚠ 払戻が取れない: ${r.date} ${r.name}`);
-  } else {
-    store[r.id] = { date: r.date, track: r.track, name: r.name, grade: r.grade, payouts };
+// import.meta.url で「直接実行された時だけ」動くようにガードする。
+// これが無いと、他スクリプトから parsePayouts だけを import した際にも
+// このクロールループ一式が(しかも process.argv を共有した状態で)勝手に実行されてしまう。
+async function main() {
+  const { data: races, error } = await supabase
+    .from("race_results")
+    .select("id, date, track, name, grade, cname")
+    .order("date");
+  if (error) {
+    console.error(error);
+    process.exit(1);
   }
-  done++;
-  if (DRY) console.log(r.date, r.name, JSON.stringify(payouts));
-  process.stdout.write(`\r${done}/${Math.min(targets.length, LIMIT)} ${r.date} ${r.name}          `);
-  await sleep(DELAY_MS);
+  const targets = races.filter((r) => r.grade && !r.grade.startsWith("J") && r.cname);
+
+  let store = {};
+  if (fs.existsSync(OUT)) store = JSON.parse(fs.readFileSync(OUT, "utf-8"));
+
+  let done = 0;
+  for (const r of targets) {
+    if (done >= LIMIT) break;
+    if (SKIP_EXISTING && store[r.id]) continue;
+    const html = await getResultHtml(r.cname);
+    const payouts = parsePayouts(html);
+    if (!payouts || !payouts.win?.length) {
+      console.warn(`⚠ 払戻が取れない: ${r.date} ${r.name}`);
+    } else {
+      store[r.id] = { date: r.date, track: r.track, name: r.name, grade: r.grade, payouts };
+    }
+    done++;
+    if (DRY) console.log(r.date, r.name, JSON.stringify(payouts));
+    process.stdout.write(`\r${done}/${Math.min(targets.length, LIMIT)} ${r.date} ${r.name}          `);
+    await sleep(DELAY_MS);
+  }
+  fs.writeFileSync(OUT, JSON.stringify(store, null, 1));
+  console.log(`\n保存: ${OUT}(${Object.keys(store).length}レース分)`);
 }
-fs.writeFileSync(OUT, JSON.stringify(store, null, 1));
-console.log(`\n保存: ${OUT}(${Object.keys(store).length}レース分)`);
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  await main();
+}

@@ -1,10 +1,13 @@
-// 指定日・指定場の全レースのオッズ(単勝・複勝、オプションでワイド・馬連)を JRA公式から
-// 取得してローカルJSON(scripts/odds.local.json、gitignore済み)にスナップショット保存する
-// ローカルバッチ。フェーズ4Bの試験版(DB書き込みなし・Vercel cron化は動作検証後)。
+// 指定日・指定場の全レースのオッズ(単勝・複勝、オプションでワイド・馬連・3連複・3連単)を
+// JRA公式から取得してローカルJSON(scripts/odds.local.json、gitignore済み)にスナップショット
+// 保存するローカルバッチ。フェーズ4Bの試験版(DB書き込みなし・Vercel cron化は動作検証後)。
 //
 // 使い方(プロジェクト直下で):
 //   node scripts/fetch-odds.mjs --date 2026-07-11 --track 福島 --label morning
 //   node scripts/fetch-odds.mjs --date 2026-07-11 --track 福島 --label afternoon --bets tanpuku,wide,umaren
+//   node scripts/fetch-odds.mjs --date 2026-07-11 --track 福島 --bets tanpuku,trio,tierce --max-requests 100
+//     … 3連複・3連単込み(1レースあたり単複+trio+tierceで3リクエスト、12レースなら36件。
+//       3連単ページは1レースあたり数百KB〜1MB近くと重いので、対象を絞って使うこと)
 //   node scripts/fetch-odds.mjs --date 2026-07-11 --track 福島 --dry   … クロール連鎖の確認のみ(保存なし)
 //
 // ⚠️ 制約(2026-07-10偵察・memory keiba-app-phase4b-odds-recon):
@@ -160,6 +163,59 @@ function parseCombi(html, kind) {
   return out;
 }
 
+// 3連複表(table.fuku3)。<caption>1-2</caption> の下に3頭目(th)×オッズ(td)が並ぶ。
+// 返り値: { "1-2-3": odds }(キーは3頭を昇順ソートして結合)
+function parseTrio(html) {
+  const out = {};
+  const blocks = html.match(/<caption>[\s\S]*?<\/caption>[\s\S]*?<\/tbody>/g) ?? [];
+  for (const block of blocks) {
+    const capTxt = stripTags((block.match(/<caption>([\s\S]*?)<\/caption>/) ?? [])[1] ?? "");
+    const basePair = capTxt.split("-").map(Number);
+    if (basePair.length !== 2 || basePair.some((n) => !Number.isFinite(n))) continue;
+    const rows = block.match(/<tr[\s\S]*?<\/tr>/g) ?? [];
+    for (const tr of rows) {
+      const third = toNum(stripTags((tr.match(/<th[^>]*>([\s\S]*?)<\/th>/) ?? [])[1] ?? ""));
+      if (third == null) continue;
+      const v = toNum(stripTags((tr.match(/<td[^>]*>([\s\S]*?)<\/td>/) ?? [])[1] ?? ""));
+      if (v == null) continue; // &nbsp;(無効な組み合わせ)はスキップ
+      const key = [...basePair, third].sort((a, b) => a - b).join("-");
+      out[key] = v;
+    }
+  }
+  return out;
+}
+
+// 3連単表(div.tan3_unit)。1着(h4見出し) > li(2着ごと) > table(3着ごとの単一オッズ)の3階層。
+// 返り値: { "1-2-3": odds }(キーは着順どおり=順序を保持、ソートしない)
+function parseTierce(html) {
+  const out = {};
+  const units = html.split('<div class="tan3_unit').slice(1);
+  for (const rawUnit of units) {
+    const unit = '<div class="tan3_unit' + rawUnit;
+    const firstNum = toNum(
+      stripTags((unit.match(/<h4[^>]*>[\s\S]*?<span class="num">([\s\S]*?)<\/span>/) ?? [])[1] ?? ""),
+    );
+    if (firstNum == null) continue;
+    const lis = unit.match(/<li>[\s\S]*?<\/table>[\s\S]*?<\/li>/g) ?? [];
+    for (const li of lis) {
+      const nums = [...li.matchAll(/<div class="num">([\s\S]*?)<\/div>/g)].map((m) =>
+        toNum(stripTags(m[1])),
+      );
+      const second = nums[1]; // nums[0]は1着(unitと重複)、nums[1]がこのliの2着
+      if (second == null) continue;
+      const rows = li.match(/<tr[\s\S]*?<\/tr>/g) ?? [];
+      for (const tr of rows) {
+        const third = toNum(stripTags((tr.match(/<th[^>]*>([\s\S]*?)<\/th>/) ?? [])[1] ?? ""));
+        if (third == null) continue;
+        const v = toNum(stripTags((tr.match(/<td[^>]*>([\s\S]*?)<\/td>/) ?? [])[1] ?? ""));
+        if (v == null) continue; // &nbsp;(無効な組み合わせ)はスキップ
+        out[`${firstNum}-${second}-${third}`] = v;
+      }
+    }
+  }
+  return out;
+}
+
 // ---- クロール連鎖 ----
 console.log(`■ オッズ取得  ${DATE} ${TRACK}  label=${LABEL}  bets=${BETS.join(",")}  DRY=${DRY}`);
 const [, mm, dd] = DATE.match(/^\d{4}-(\d{2})-(\d{2})$/) ?? [];
@@ -245,6 +301,12 @@ for (const l of raceLinks) {
   }
   if (BETS.includes("umaren") && tp.betCnames.umaren) {
     race.umaren = parseCombi(await postO(tp.betCnames.umaren), "umaren");
+  }
+  if (BETS.includes("trio") && tp.betCnames.trio) {
+    race.trio = parseTrio(await postO(tp.betCnames.trio));
+  }
+  if (BETS.includes("tierce") && tp.betCnames.tierce) {
+    race.tierce = parseTierce(await postO(tp.betCnames.tierce));
   }
   snapshot.races.push(race);
   const n = Object.keys(tp.horses).length;
