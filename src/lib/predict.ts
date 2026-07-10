@@ -1,11 +1,13 @@
-// 簡易予想スコア(フェーズ4C→4A拡張)。
-// 出馬表の各馬を、過去1年の重賞結果(race_results)+ 出馬表に埋まっていた直近4走(horse_past_runs)で採点する。
+// 簡易予想スコア(フェーズ4C→4A→4E拡張)。
+// 出馬表の各馬を、過去のレース結果(race_results。4E以降は重賞に加えOP/条件戦も入っている)
+// + 出馬表に埋まっていた直近4走(horse_past_runs)で採点する。
 //
-// スコア = 馬の重賞実績 + 近走の調子(フォーム)+ 騎手の重賞複勝率 + 斤量(ハンデ差)
-//  - 重賞実績: 着順ポイント × グレード重み × 直近重み + 距離適性 を平均し、走数が少ないほど縮める
-//  - 近走(4A): 直近4走の着順を前走ほど重く評価 + 当該コース(距離/芝ダ)適性。
+// スコア = 馬の実績 + 近走の調子(フォーム)+ 騎手の複勝率 + 斤量(ハンデ差)
+//  - 実績: 着順ポイント × クラス重み × 直近重み + 距離適性 を平均し、走数が少ないほど縮める。
+//    クラス重みは重賞ならgrade、条件戦などgrade無しはレース名の級表記(未勝利/1勝…)から推定(4E)。
+//  - 近走(4A): 直近4走の着順を前走ほど重く評価 × クラス重み + 当該コース(距離/芝ダ)適性。
 //    重賞履歴に出てこない条件戦好走馬(サヴォーナ等)を拾うのが狙い。
-//  - 騎手: 過去1年重賞の複勝率 × 30(騎乗5回未満は標本不足として中立=0)
+//  - 騎手: 複勝率 × 30(騎乗5回未満は標本不足として中立=0)。4E以降は条件戦の騎乗も母数に入る。
 //  - 斤量: (出走馬平均 − 自身の斤量) × 2(ハンデ戦では軽いほうがプラス)
 //
 // あくまで「まず動く」ための透明な採点。精度はバックテスト(scripts/backtest.mjs)で検証する。
@@ -54,7 +56,13 @@ export interface RacePrediction {
 type HistRow = {
   name: string;
   place: number | null;
-  race_results: { date: string; grade: string | null; surface: string | null; distance: number | null };
+  race_results: {
+    date: string;
+    name: string | null;
+    grade: string | null;
+    surface: string | null;
+    distance: number | null;
+  };
 };
 type JockeyRow = { jockey: string | null; place: number | null };
 
@@ -75,21 +83,51 @@ async function fetchAllRows<T>(
 }
 const GRADE_W: Record<string, number> = { G1: 1.5, G2: 1.2, G3: 1.0 };
 
+// クラス重み(フェーズ4E)。重賞は grade、OP/リステッド/条件戦(grade=null)はレース名の
+// 級表記から推定する。grade=null を一律1.0にすると「未勝利勝ち」が「G3勝ち」と同点に
+// なってしまうため、級で割り引く。
+export function classWeight(
+  grade: string | null | undefined,
+  raceName: string | null | undefined,
+): number {
+  const gw = GRADE_W[grade ?? ""];
+  if (gw) return gw;
+  const n = raceName ?? "";
+  if (/新馬|未勝利|メイクデビュー/.test(n)) return 0.3;
+  if (/[1１]勝クラス/.test(n)) return 0.5;
+  if (/[2２]勝クラス/.test(n)) return 0.65;
+  if (/[3３]勝クラス/.test(n)) return 0.8;
+  if (/オープン/.test(n)) return 0.9;
+  return 0.7; // 級表記が無い(出馬表の過去走セルは特別戦名だけの場合がある)は中間の重み
+}
+
+// 障害レース判定。重賞はgrade(J.G*)で分かるが、平場障害はgrade=nullなので
+// レース名・コース種別でも判定する(4Eで混入するようになった)。
+export function isJumpRun(
+  grade: string | null | undefined,
+  raceName: string | null | undefined,
+  surface: string | null | undefined,
+): boolean {
+  return (
+    String(grade ?? "").startsWith("J") || surface === "障" || /障害/.test(raceName ?? "")
+  );
+}
+
 const placePts = (p: number | null): number =>
   p === 1 ? 10 : p === 2 ? 7 : p === 3 ? 5 : p === 4 ? 3 : p === 5 ? 2 : p != null && p <= 9 ? 1 : 0;
 
-// 馬の重賞実績スコア。runs は障害を除いた過去1年の重賞成績。
+// 馬の実績スコア。runs は障害を除いた過去の平地成績(4E以降は重賞+OP/条件戦)。
 // target を渡すと距離適性を当該レースのコースで判定する(未指定なら適性ボーナス無し)。
 export function scoreHorse(
   runs: HistRow[],
   now: Date,
   target: Target = { distance: null, surface: null },
 ): { pts: number; label: string } {
-  if (runs.length === 0) return { pts: 0, label: "重賞実績なし" };
+  if (runs.length === 0) return { pts: 0, label: "実績なし" };
   let total = 0;
   const labels: string[] = [];
   for (const r of runs) {
-    const gw = GRADE_W[r.race_results.grade ?? ""] ?? 1.0;
+    const gw = classWeight(r.race_results.grade, r.race_results.name);
     const ageMonths = (now.getTime() - new Date(r.race_results.date).getTime()) / (1000 * 3600 * 24 * 30);
     const rw = ageMonths <= 3 ? 1.2 : ageMonths <= 6 ? 1.0 : 0.8; // 直近重視
     // 距離適性: 当該レースと同じ芝ダ・近い距離で5着以内なら +1
@@ -106,11 +144,14 @@ export function scoreHorse(
 }
 
 // 近走(直近4走)の調子スコア。past は最新順(runNo 1=前走)。
-//  - 前走ほど重く着順を評価(recencyW)
+//  - 前走ほど重く着順を評価(recencyW)× クラス重み(4E: 未勝利好走をOP好走と同格にしない)
 //  - 頭数の多いレースでの好走を少し高く(strengthMul)
 //  - 当該コース(距離/芝ダ)への適性を加点(全レース固定だった旧仕様のバグ解消)
 export function scoreForm(past: PastRun[], target: Target): { pts: number; label: string } {
-  const runs = past.filter((p) => p.place != null); // 中止・除外(place=null)は評価対象外
+  // 中止・除外(place=null)と障害戦は評価対象外
+  const runs = past.filter(
+    (p) => p.place != null && !isJumpRun(p.grade, p.raceName, p.surface),
+  );
   if (runs.length === 0) return { pts: 0, label: "近走データなし" };
   const recencyW = (runNo: number): number =>
     runNo <= 1 ? 1.0 : runNo === 2 ? 0.75 : runNo === 3 ? 0.55 : 0.4;
@@ -120,7 +161,7 @@ export function scoreForm(past: PastRun[], target: Target): { pts: number; label
   for (const p of runs) {
     const rw = recencyW(p.runNo);
     const strengthMul = p.fieldSize != null ? Math.min(1.2, Math.max(0.7, p.fieldSize / 14)) : 1;
-    raw += placePts(p.place) * rw * strengthMul;
+    raw += placePts(p.place) * classWeight(p.grade, p.raceName) * rw * strengthMul;
     if (p.place != null && p.place <= 5) apt += aptBonus(p.surface, p.distance, target) * rw * 2;
   }
   // 平均ベース。走数2未満は縮める。K=6 で重賞実績スコアと同オーダーに。
@@ -165,7 +206,7 @@ export async function buildPredictions(cards: RaceCard[]): Promise<RacePredictio
       fetchAllRows((from, to) =>
         supabase
           .from("result_horses")
-          .select("name, place, race_results(date, grade, surface, distance)")
+          .select("name, place, race_results(date, name, grade, surface, distance)")
           .in("name", allNames)
           .order("id")
           .range(from, to),
@@ -196,9 +237,11 @@ export async function buildPredictions(cards: RaceCard[]): Promise<RacePredictio
         : 0;
 
     const scored = card.horses.map((h) => {
-      // 障害(J.G*)は平地の予想材料から除外
+      // 障害は平地の予想材料から除外(重賞J.G*だけでなく平場障害もgrade=nullで入ってくる)
       const runs = hist.filter(
-        (r) => r.name === h.name && !String(r.race_results?.grade ?? "").startsWith("J"),
+        (r) =>
+          r.name === h.name &&
+          !isJumpRun(r.race_results?.grade, r.race_results?.name, r.race_results?.surface),
       );
       const hs = scoreHorse(runs, now, target);
       const fs = scoreForm(h.past ?? [], target);

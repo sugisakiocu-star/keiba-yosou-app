@@ -44,7 +44,24 @@ const GRADE_W = { G1: 1.5, G2: 1.2, G3: 1.0 };
 const placePts = (p) =>
   p === 1 ? 10 : p === 2 ? 7 : p === 3 ? 5 : p === 4 ? 3 : p === 5 ? 2 : p != null && p <= 9 ? 1 : 0;
 
+// クラス重み(4E・predict.ts と同期)。重賞は grade、条件戦などはレース名の級表記から。
+function classWeight(grade, raceName) {
+  const gw = GRADE_W[grade ?? ""];
+  if (gw) return gw;
+  const n = String(raceName ?? "");
+  if (/新馬|未勝利|メイクデビュー/.test(n)) return 0.3;
+  if (/[1１]勝クラス/.test(n)) return 0.5;
+  if (/[2２]勝クラス/.test(n)) return 0.65;
+  if (/[3３]勝クラス/.test(n)) return 0.8;
+  if (/オープン/.test(n)) return 0.9;
+  return 0.7;
+}
+// 障害判定(4E・predict.ts と同期)。平場障害は grade=null なので名前/コースでも見る。
+const isJumpRun = (grade, raceName, surface) =>
+  String(grade ?? "").startsWith("J") || surface === "障" || /障害/.test(String(raceName ?? ""));
+
 // v1(旧・ベースライン): 距離適性は芝1800〜2200に固定。フォーム(近走)無し。
+// ⚠️ v1は比較基準として旧仕様のまま凍結(4E後は条件戦もG3と同じ重み1.0で採点される)。
 function scoreHorseV1(runs, now) {
   if (runs.length === 0) return 0;
   let total = 0;
@@ -75,7 +92,7 @@ function scoreHorse(runs, now, target) {
   if (runs.length === 0) return 0;
   let total = 0;
   for (const r of runs) {
-    const gw = GRADE_W[r.meta.grade ?? ""] ?? 1.0;
+    const gw = classWeight(r.meta.grade, r.meta.name);
     const ageMonths = (now.getTime() - new Date(r.meta.date).getTime()) / (1000 * 3600 * 24 * 30);
     const rw = ageMonths <= 3 ? 1.2 : ageMonths <= 6 ? 1.0 : 0.8;
     const apt = r.place != null && r.place <= 5 ? aptBonus(r.meta.surface, r.meta.distance, target) : 0;
@@ -84,7 +101,7 @@ function scoreHorse(runs, now, target) {
   return (total / runs.length) * Math.min(1, runs.length / 3) * 10;
 }
 // past: 最新順(runNo 1=前走)。predict.ts の scoreForm を複製。
-// ⚠️ バックテストでは近走を result_horses(=重賞のみ)から組むため、実運用(全レースの4走)より弱い近似。
+// 4E以降、2026年分の近走は全レース(条件戦含む)の実データ。2025年以前は重賞のみの近似のまま。
 function scoreForm(past, target) {
   const runs = past.filter((p) => p.place != null);
   if (runs.length === 0) return 0;
@@ -94,7 +111,7 @@ function scoreForm(past, target) {
   for (const p of runs) {
     const rw = recencyW(p.runNo);
     const strengthMul = p.fieldSize != null ? Math.min(1.2, Math.max(0.7, p.fieldSize / 14)) : 1;
-    raw += placePts(p.place) * rw * strengthMul;
+    raw += placePts(p.place) * classWeight(p.grade, p.raceName) * rw * strengthMul;
     if (p.place <= 5) apt += aptBonus(p.surface, p.distance, target) * rw * 2;
   }
   return (raw / runs.length) * Math.min(1, runs.length / 2) * 6 + apt;
@@ -162,10 +179,12 @@ const MARKS = ["◎", "○", "▲", "△", "△"];
 const mkStat = () => ({ win: 0, top3: 0, top5Hit: 0 });
 const stat = { n: 0, v1: mkStat(), v2: mkStat(), fav: mkStat() };
 
-// 指定馬の、race.date より前の重賞成績を最新順に最大4走ぶん PastRun 化する。
+// 指定馬の、race.date より前の平地成績を最新順に最大4走ぶん PastRun 化する。
 function buildPast(name, beforeDate) {
   return (byHorse.get(name) ?? [])
-    .filter((r) => r.meta.date < beforeDate && !String(r.meta.grade ?? "").startsWith("J"))
+    .filter(
+      (r) => r.meta.date < beforeDate && !isJumpRun(r.meta.grade, r.meta.name, r.meta.surface),
+    )
     .sort((a, b) => (a.meta.date < b.meta.date ? 1 : -1)) // 新しい順
     .slice(0, 4)
     .map((r, i) => ({
@@ -174,6 +193,8 @@ function buildPast(name, beforeDate) {
       fieldSize: r.fieldSize,
       distance: r.meta.distance,
       surface: r.meta.surface,
+      grade: r.meta.grade,
+      raceName: r.meta.name,
     }));
 }
 
@@ -203,7 +224,7 @@ for (const race of targets) {
   const wPtsOf = (h) => (h.weight_carry != null && avgW > 0 ? (avgW - Number(h.weight_carry)) * 2 : 0);
   const runsOf = (h) =>
     (byHorse.get(h.name) ?? []).filter(
-      (r) => r.meta.date < race.date && !String(r.meta.grade ?? "").startsWith("J"),
+      (r) => r.meta.date < race.date && !isJumpRun(r.meta.grade, r.meta.name, r.meta.surface),
     );
   const jockeyPtsOf = (h) =>
     scoreJockey((byJockey.get(h.jockey) ?? []).filter((r) => r.meta.date < race.date));
@@ -252,5 +273,5 @@ console.log(line("v1(旧・重賞実績のみ)   ", stat.v1));
 console.log(line("v2(近走+コース適性追加)", stat.v2));
 console.log(line("1番人気(市場ベースライン)", stat.fav));
 console.log(
-  "\n※ v2の近走はバックテストでは重賞のみから組む近似(実運用は全レースの直近4走)。条件戦好走の効果は本番の方が強く出る。",
+  "\n※ 4E以降: 2026年分の実績・近走は全レース(条件戦含む)の実データ、2025年以前は重賞のみの近似。",
 );
