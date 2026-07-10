@@ -13,7 +13,9 @@
 //   3連複20点: 上位6頭(◎○▲△△☆)ボックス C(6,3)=20
 //   3連単60点: ◎軸1頭マルチ・相手○▲△△☆(5頭) C(5,2)×3!=60
 //
-// 使い方: node scripts/bets-backtest.mjs [--since YYYY-MM-DD] [--verbose]
+// 使い方: node scripts/bets-backtest.mjs [--since YYYY-MM-DD] [--verbose] [--dist]
+//   --dist: 券種ごとに「上位1件の的中を除いた回収率」も併記する。
+//   (memory: keiba-app-payout-concentration — 超大穴1件が合計回収率を吊り上げる罠の確認用)
 
 import { createClient } from "@supabase/supabase-js";
 import fs from "node:fs";
@@ -24,6 +26,7 @@ const args = process.argv.slice(2);
 const sinceIdx = args.indexOf("--since");
 const SINCE = sinceIdx >= 0 ? args[sinceIdx + 1] : null;
 const VERBOSE = args.includes("--verbose");
+const DIST = args.includes("--dist");
 
 try {
   process.loadEnvFile(".env");
@@ -167,7 +170,7 @@ const BET_TYPES = [
   "3連複20点(300円×20)",
   "3連単60点(100円×60)",
 ];
-const agg = Object.fromEntries(BET_TYPES.map((t) => [t, { cost: 0, ret: 0, hit: 0, races: 0 }]));
+const agg = Object.fromEntries(BET_TYPES.map((t) => [t, { cost: 0, ret: 0, hit: 0, races: 0, hits: [] }]));
 // 参考: 1番人気ベースライン
 const fav = { tan: { cost: 0, ret: 0, hit: 0, races: 0 }, fuku: { cost: 0, ret: 0, hit: 0, races: 0 } };
 
@@ -284,7 +287,10 @@ for (const race of targets) {
     agg[type].cost += cost;
     agg[type].ret += ret;
     agg[type].races++;
-    if (ret > 0) agg[type].hit++;
+    if (ret > 0) {
+      agg[type].hit++;
+      agg[type].hits.push({ date: race.date, name: race.name, ret });
+    }
   }
 
   // 1番人気ベースライン(単勝/複勝 各6000円)
@@ -311,7 +317,18 @@ for (const race of targets) {
 const fmt = (s) =>
   `的中率 ${((s.hit / Math.max(s.races, 1)) * 100).toFixed(1).padStart(5)}% / 回収率 ${((s.ret / Math.max(s.cost, 1)) * 100).toFixed(1).padStart(6)}% / 投資 ${s.cost.toLocaleString()}円 → 払戻 ${Math.round(s.ret).toLocaleString()}円`;
 console.log(`\n===== 券種別シミュレーション(平地重賞 ${nRaces}レース・各券種6,000円/レース) =====`);
-for (const t of BET_TYPES) console.log(`${t.padEnd(16, "　")} ${fmt(agg[t])}`);
+for (const t of BET_TYPES) {
+  console.log(`${t.padEnd(16, "　")} ${fmt(agg[t])}`);
+  if (DIST && agg[t].hits.length > 0) {
+    const top = [...agg[t].hits].sort((a, b) => b.ret - a.ret)[0];
+    const restCost = agg[t].cost; // 除外しても投資額は不変(全レース分買っているため)
+    const restRet = agg[t].ret - top.ret;
+    console.log(
+      `  └ 上位1件除く: 回収率 ${((restRet / Math.max(restCost, 1)) * 100).toFixed(1)}%  ` +
+        `(除外: ${top.date} ${top.name} 払戻${Math.round(top.ret).toLocaleString()}円)`,
+    );
+  }
+}
 console.log("---- 参考(市場ベースライン) ----");
 console.log(`1番人気 単勝6000円　 ${fmt(fav.tan)}`);
 console.log(`1番人気 複勝6000円　 ${fmt(fav.fuku)}`);
