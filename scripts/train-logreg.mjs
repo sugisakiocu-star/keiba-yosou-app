@@ -4,6 +4,8 @@
 // 使い方(プロジェクト直下で):
 //   node scripts/train-logreg.mjs
 //   node scripts/train-logreg.mjs --train-from 2024-07-01 --test-from 2026-01-01
+//   node scripts/train-logreg.mjs --with-pop --bootstrap 10000   # 市場超えの頑健性チェック
+//   node scripts/train-logreg.mjs --with-pop --with-corners      # 4K: cornerGain特徴量込み
 //
 // 設計:
 //   - 「レース内で誰が勝つか」を直接モデル化する条件付きロジット。
@@ -18,6 +20,7 @@
 // ⚠️ classWeight/isJumpRun/aptBonus は predict.ts / backtest.mjs と同じ定義(変更時は要同期)。
 
 import { createClient } from "@supabase/supabase-js";
+import fs from "node:fs";
 
 // ---- CLI引数 ----
 const args = process.argv.slice(2);
@@ -36,6 +39,15 @@ const STAGES = Number(argOf("--stages", "3"));
 // --with-pop: 人気(=市場の評価)を特徴量に加える。「うちの特徴量は市場に上乗せできる情報を
 // 持っているか」の検証用(Benter方式: 市場確率+ファンダメンタルズの合成が実運用のEVの本命)。
 const WITH_POP = args.includes("--with-pop");
+// --bootstrap N: 検証セットをレース単位でN回リサンプリングし、「モデルlogloss − 人気ベースラインlogloss」
+// の平均差の95%信頼区間を出す。重賞69R程度の小標本で「市場超え」がノイズと区別できるかの判定用。
+// 学習自体は決定的(フルバッチ+ゼロ初期化)なので、不確実性の源は検証レースのサンプリングのみ。
+const BOOTSTRAP = Number(argOf("--bootstrap", "0"));
+// --with-corners: scripts/corners.local.json(backfill-corners.mjsの出力)から cornerGain 特徴量を追加。
+// cornerGain = 過去走の「最初のコーナー通過pct − 最終コーナーpct」(プラス=道中で順位を上げた)。
+// 対象レース自身のコーナーは道中の情報=結果の一部でリークになるため、他の近走系特徴量と同じく
+// 「対象レースより前の走」だけから計算する。クロール完走前でも動く(欠損は学習平均埋め)。
+const WITH_CORNERS = args.includes("--with-corners");
 
 // ---- env / supabase ----
 try {
@@ -50,6 +62,19 @@ if (!url || !key) {
   process.exit(1);
 }
 const supabase = createClient(url, key);
+
+// ---- 4K: コーナー通過順データ(--with-corners時のみ読む) ----
+// 形式: { result_id: { corners: { umaban: "3-3-4-5", ... }, ... } } (leg-style-check.mjsと同じ)
+let cornersByResult = null;
+if (WITH_CORNERS) {
+  try {
+    cornersByResult = JSON.parse(fs.readFileSync(new URL("./corners.local.json", import.meta.url).pathname, "utf-8"));
+    console.log(`コーナーデータ ${Object.keys(cornersByResult).length}レース分をロード(--with-corners)`);
+  } catch (e) {
+    console.error("scripts/corners.local.json が読めません(--with-cornersにはbackfill-corners.mjsの出力が必要):", e.message);
+    process.exit(1);
+  }
+}
 
 // ---- 共通定義(predict.ts / backtest.mjs と同期) ----
 const GRADE_W = { G1: 1.5, G2: 1.2, G3: 1.0 };
@@ -123,7 +148,7 @@ console.log("データロード中…");
 const races = await fetchAll("race_results", "id, date, track, name, grade, surface, distance, going", "date");
 const rows = await fetchAll(
   "result_horses",
-  "result_id, place, place_text, name, jockey, weight_carry, popularity, waku, last3f, horse_weight, horse_weight_diff, trainer, sex_age",
+  "result_id, place, place_text, name, jockey, weight_carry, popularity, waku, umaban, last3f, horse_weight, horse_weight_diff, trainer, sex_age",
   "id",
 );
 console.log(`  races=${races.length} horses=${rows.length}`);
@@ -162,6 +187,8 @@ for (const h of rows) {
     weightCarry: h.weight_carry,
     fieldSize: fieldSizeByResult.get(h.result_id) ?? null,
     l3pct: last3fPct.get(`${h.result_id}:${h.name}`) ?? null,
+    resultId: h.result_id, // 4K: corners.local.json をレースIDで引くため
+    umaban: h.umaban, // 4K: コーナー通過順は馬番キー
     meta,
   });
   if (h.jockey) {
@@ -249,12 +276,30 @@ const FEATURES = [
   "trainerTrackRate", // 調教師×競馬場の複勝率(当日まで、5出走未満は学習全体平均)。滞在競馬・得意場の指標
   "layoffRunNo", // 休養明け(90日以上の間隔)から何戦目か(1=休み明け初戦、上限6)。叩き良化型の指標
 ];
+// ---- 4K追加(--with-corners時のみ): コーナー通過順から作る「道中の伸び」 ----
+if (WITH_CORNERS) FEATURES.push("cornerGain"); // 近走4走の(最初のコーナーpct−最終コーナーpct)の直近重み付き平均。leg-style-check.mjsで先行検証済み
 if (WITH_POP) FEATURES.push("popLog"); // log(人気)。市場のレース前評価(発走前に既知なのでリークではない)
 const toNumSafe = (s) => {
   const n = Number(s);
   return Number.isFinite(n) ? n : null;
 };
 const recencyW = (n) => (n <= 1 ? 1.0 : n === 2 ? 0.75 : n === 3 ? 0.55 : 0.4);
+
+// ---- 4K: 過去1走ぶんの cornerGain(道中の伸び)。leg-style-check.mjs の legStyleOf と同じ正規化 ----
+// 頭数はコーナー記録自体の頭数(rec.cornersのキー数)を使う。通過順が1コーナー分しか無い場合は
+// 「道中の変化」が定義できないので欠損(null)扱い。
+function cornerGainOf(run) {
+  const rec = cornersByResult?.[run.resultId];
+  const cornerStr = rec?.corners?.[run.umaban];
+  if (!cornerStr) return null;
+  const fieldSize = Object.keys(rec.corners).length;
+  if (fieldSize < 2) return null;
+  const parts = String(cornerStr).split("-").map(Number).filter((n) => Number.isFinite(n));
+  if (parts.length < 2) return null;
+  const firstPct = (parts[0] - 1) / (fieldSize - 1);
+  const lastPct = (parts.at(-1) - 1) / (fieldSize - 1);
+  return firstPct - lastPct; // プラス=道中で順位を上げた(差し・追込の伸び)
+}
 
 function buildFeatures(h, race, avgW) {
   const runs = horseRunsBefore(h.name, race.date);
@@ -352,6 +397,22 @@ function buildFeatures(h, race, avgW) {
   } else {
     f.formPct = 0.5;
   }
+  // ---- 4K: cornerGain(--with-corners時のみ) ----
+  // ⚠️ リーク防止: 使うのは last4(=対象レースより前の走)のコーナーだけ。当該レース自身の
+  // コーナー通過順は「道中の結果」そのものなので絶対に使わない。formPct等と同じ設計方針。
+  if (WITH_CORNERS) {
+    let g = 0;
+    let gw = 0;
+    last4.forEach((r, i) => {
+      const gain = cornerGainOf(r);
+      if (gain != null) {
+        g += gain * recencyW(i + 1);
+        gw += recencyW(i + 1);
+      }
+    });
+    // 欠損(コーナー未クロール/初出走)は NaN → 後で jockeyRate 等と同じく学習全体平均で埋める
+    f.cornerGain = gw > 0 ? g / gw : NaN;
+  }
   const sa = String(h.sex_age ?? "");
   f.femaleD = sa.startsWith("牝") ? 1 : 0;
   f.age = toNumSafe(sa.match(/\d+/)?.[0]) ?? 4;
@@ -411,8 +472,18 @@ if (WITH_POP)
   for (const s of [...trainRaces, ...testRaces])
     for (const e of s.entrants) e.f.popLog = Math.log(popProb(e.h.popularity));
 
+// 4K: cornerGainのカバレッジを表示(クロール進行中は欠損が多い前提。NaN埋め前に数える)
+if (WITH_CORNERS) {
+  const ents = [...trainRaces, ...testRaces].flatMap((s) => s.entrants);
+  const ok = ents.filter((e) => !Number.isNaN(e.f.cornerGain)).length;
+  console.log(
+    `  cornerGainカバレッジ: ${ok}/${ents.length}頭 (${((ok / ents.length) * 100).toFixed(1)}%) ※欠損は学習平均で埋める`,
+  );
+}
+
 // レート系のNaNを学習全体平均で埋める+標準化(平均0/分散1、学習セットの統計のみ使用)
-for (const key of ["jockeyRate", "trainerRate", "trainerTrackRate"]) {
+// ⚠️ NaN埋めが必要な特徴量を追加したら必ずこのリストにも追加(忘れると全重みNaNになる)
+for (const key of ["jockeyRate", "trainerRate", "trainerTrackRate", ...(WITH_CORNERS ? ["cornerGain"] : [])]) {
   const vals = trainRaces.flatMap((s) => s.entrants.map((e) => e.f[key])).filter((v) => !Number.isNaN(v));
   const m = vals.reduce((a, b) => a + b, 0) / Math.max(vals.length, 1);
   for (const s of [...trainRaces, ...testRaces])
@@ -505,6 +576,7 @@ function evaluate(samples, label) {
     v2: { win: 0, top3: 0, top5: 0, r: mkR() },
     fav: { win: 0, top3: 0, ll: 0, r: mkR() },
   };
+  const llPairs = []; // レースごとの [モデルlogloss, 人気ベースラインlogloss](--bootstrap用)
   for (const s of samples) {
     const race = s.race;
     const target = { distance: race.distance, surface: race.surface };
@@ -561,6 +633,7 @@ function evaluate(samples, label) {
     const rawP = s.entrants.map((e) => popProb(e.h.popularity));
     const Z = rawP.reduce((a, b) => a + b, 0);
     st.fav.ll -= Math.log(Math.max(rawP[winIdx] / Z, 1e-12));
+    llPairs.push([-Math.log(Math.max(p[winIdx], 1e-12)), -Math.log(Math.max(rawP[winIdx] / Z, 1e-12))]);
     const favOrder = s.entrants
       .map((e, i) => [e.h.popularity ?? 99, i])
       .sort((a, b) => a[0] - b[0])
@@ -585,6 +658,48 @@ function evaluate(samples, label) {
   console.log(rline("ロジ回帰      ", st.model.r));
   console.log(rline("v2(手動重み)  ", st.v2.r));
   console.log(rline("人気順        ", st.fav.r));
+  if (BOOTSTRAP > 0) bootstrapReport(llPairs, label);
+}
+
+// ---- ブートストラップ(--bootstrap N) ----
+// レース単位のペア差 d_i = (モデルの-log p) − (人気ベースラインの-log p) をN回リサンプリングし、
+// 平均差の95%信頼区間と「差>=0(=市場に勝てていない)になる確率」を出す。差が負=モデル優位。
+// 学習は決定的(フルバッチAdam+ゼロ初期化)なので、不確実性の源は検証レースの標本抽出のみ。
+// 乱数はシード固定(mulberry32)で毎回同じ結果になる(再現性のため)。
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function bootstrapReport(llPairs, label) {
+  const n = llPairs.length;
+  if (n === 0) return;
+  const diffs = llPairs.map(([m, f]) => m - f);
+  const obs = diffs.reduce((a, b) => a + b, 0) / n;
+  const rand = mulberry32(42);
+  const means = new Array(BOOTSTRAP);
+  for (let b = 0; b < BOOTSTRAP; b++) {
+    let sum = 0;
+    for (let i = 0; i < n; i++) sum += diffs[(rand() * n) | 0];
+    means[b] = sum / n;
+  }
+  means.sort((a, b) => a - b);
+  const q = (p) => means[Math.min(BOOTSTRAP - 1, Math.floor(p * BOOTSTRAP))];
+  const pNotBetter = means.filter((m) => m >= 0).length / BOOTSTRAP;
+  console.log(`--- ブートストラップ: logloss差(モデル−人気ベースライン、負=モデル優位) n=${n}R B=${BOOTSTRAP} ---`);
+  console.log(
+    `観測差 ${obs >= 0 ? "+" : ""}${obs.toFixed(4)} / 95%CI [${q(0.025).toFixed(4)}, ${q(0.975).toFixed(4)}] / P(差>=0) ${(pNotBetter * 100).toFixed(1)}%`,
+  );
+  console.log(
+    q(0.975) < 0
+      ? `→ 市場超えは統計的に有意(95%CIが0未満)`
+      : `→ 95%CIが0を跨ぐ: この標本サイズでは「市場超え」と「誤差」を区別できない`,
+  );
 }
 
 evaluate(testRaces, `全クラス ${TEST_FROM}以降`);
