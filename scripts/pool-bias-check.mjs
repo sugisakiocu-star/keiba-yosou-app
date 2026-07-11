@@ -15,6 +15,8 @@
 //   node scripts/pool-bias-check.mjs
 //   node scripts/pool-bias-check.mjs --graded-only     # 重賞のみ
 //   node scripts/pool-bias-check.mjs --bootstrap 10000 # CI付き(既定10000、0で省略)
+//   node scripts/pool-bias-check.mjs --by dist         # 距離別(dist/going/field/all、カンマ区切り可)
+//     ※分割するとセルあたりのサンプルが小さくなる。点推定でなくCIで判断すること。
 
 import { createClient } from "@supabase/supabase-js";
 import fs from "node:fs";
@@ -25,7 +27,9 @@ const argOf = (name, dflt) => {
   return i >= 0 ? args[i + 1] : dflt;
 };
 const GRADED_ONLY = args.includes("--graded-only");
+const NONGRADED_ONLY = args.includes("--nongraded-only"); // 平場・条件戦のみ(重賞との歪みの違いを見る用)
 const BOOTSTRAP = Number(argOf("--bootstrap", "10000"));
+const BY = argOf("--by", null); // dist / going / field / all(カンマ区切り可)
 
 try {
   process.loadEnvFile(".env");
@@ -62,7 +66,7 @@ const raceMeta = new Map();
 for (let i = 0; i < resultIds.length; i += CHUNK) {
   const { data, error } = await supabase
     .from("race_results")
-    .select("id, date, grade, name, surface")
+    .select("id, date, grade, name, surface, distance, going")
     .in("id", resultIds.slice(i, i + CHUNK));
   if (error) {
     console.error("DB読み取りエラー(race_results):", error.message);
@@ -92,6 +96,7 @@ for (const rid of resultIds) {
   const horses = byResult.get(rid);
   if (!meta || !horses || isJump(meta)) continue;
   if (GRADED_ONLY && !meta.grade) continue;
+  if (NONGRADED_ONLY && meta.grade) continue;
   const pay = payouts[rid]?.payouts;
   if (!pay?.win?.length) continue;
   const winYen = new Map(pay.win.map((x) => [Number(x.num), x.yen]));
@@ -119,9 +124,11 @@ for (const rid of resultIds) {
       }
     });
   }
-  perRace.push({ bandStats });
+  perRace.push({ bandStats, meta: { distance: meta.distance, going: meta.going, fieldSize: runners.length } });
 }
-console.log(`集計対象 ${usedRaces}レース(平地のみ${GRADED_ONLY ? "・重賞のみ" : ""}、期間 ${minDate}〜${maxDate})\n`);
+console.log(
+  `集計対象 ${usedRaces}レース(平地のみ${GRADED_ONLY ? "・重賞のみ" : ""}${NONGRADED_ONLY ? "・非重賞のみ" : ""}、期間 ${minDate}〜${maxDate})\n`,
+);
 
 // ---- ブートストラップ(レース単位、シード固定で再現可能) ----
 function mulberry32(seed) {
@@ -134,16 +141,16 @@ function mulberry32(seed) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
-function bootstrapCI(bandIdx, field) {
+function bootstrapCI(sub, bandIdx, field) {
   if (BOOTSTRAP <= 0) return null;
   const rand = mulberry32(42);
-  const n = perRace.length;
+  const n = sub.length;
   const means = new Array(BOOTSTRAP);
   for (let b = 0; b < BOOTSTRAP; b++) {
     let ret = 0;
     let bets = 0;
     for (let i = 0; i < n; i++) {
-      const st = perRace[(rand() * n) | 0].bandStats[bandIdx];
+      const st = sub[(rand() * n) | 0].bandStats[bandIdx];
       ret += st[field];
       bets += st.bets;
     }
@@ -153,59 +160,60 @@ function bootstrapCI(bandIdx, field) {
   return [means[Math.floor(0.025 * BOOTSTRAP)], means[Math.min(BOOTSTRAP - 1, Math.floor(0.975 * BOOTSTRAP))]];
 }
 
-// ---- レポート ----
+// ---- レポート(subに対して帯別テーブルを印字。--byの分割でも同じ関数を使う) ----
 // 回収率 = Σ払戻円 / (100円×点数)。「top1除外」は最高払戻1件を除いた回収率(大穴1発の寄与を確認する用)
-console.log("===== 人気帯別の実測回収率(100円均等買い) =====");
-console.log("帯        点数    単勝的中  単勝回収率(top1除外)  95%CI          複勝的中  複勝回収率(top1除外)  95%CI");
-const winCalib = []; // ev-scan.mjs 用の補正係数(下で印字)
-BANDS.forEach((b, bi) => {
-  const tot = { bets: 0, winRet: 0, placeRet: 0, winHits: 0, placeHits: 0 };
-  const winList = [];
-  const placeList = [];
-  for (const r of perRace) {
-    const st = r.bandStats[bi];
-    tot.bets += st.bets;
-    tot.winRet += st.winRet;
-    tot.placeRet += st.placeRet;
-    tot.winHits += st.winHits;
-    tot.placeHits += st.placeHits;
-    if (st.winRet > 0) winList.push(st.winRet);
-    if (st.placeRet > 0) placeList.push(st.placeRet);
-  }
-  if (tot.bets === 0) return;
-  const rate = (ret) => ((ret / (tot.bets * 100)) * 100).toFixed(1) + "%";
-  const rateExTop = (ret, list) =>
-    (((ret - (list.length ? Math.max(...list) : 0)) / (tot.bets * 100)) * 100).toFixed(1) + "%";
-  const ciTxt = (ci) => (ci ? `[${(ci[0] * 100).toFixed(1)},${(ci[1] * 100).toFixed(1)}]` : "-");
-  const wci = bootstrapCI(bi, "winRet");
-  const pci = bootstrapCI(bi, "placeRet");
-  // 補正係数 = 実測単勝回収率 ÷ 0.8(控除後の理論回収率)。
-  // 単勝回収率 = 真の勝率×オッズ の期待値、オッズ ≈ 0.8/暗黙勝率 なので、
-  // 回収率/0.8 = 真の勝率/オッズ暗黙勝率(=暗黙勝率に掛けるべき倍率)になる。
-  winCalib.push({ label: b.label.trim(), factor: tot.winRet / (tot.bets * 100) / 0.8, ci: wci ? [wci[0] / 0.8, wci[1] / 0.8] : null });
-  console.log(
-    `${b.label}  ${String(tot.bets).padStart(5)}  ${String(tot.winHits).padStart(6)}  ${rate(tot.winRet).padStart(7)} (${rateExTop(tot.winRet, winList).padStart(6)})  ${ciTxt(wci).padStart(13)}  ${String(tot.placeHits).padStart(6)}  ${rate(tot.placeRet).padStart(7)} (${rateExTop(tot.placeRet, placeList).padStart(6)})  ${ciTxt(pci).padStart(13)}`,
-  );
-});
-// ---- ev-scan.mjs 用の補正係数(オッズ暗黙勝率に掛ける倍率) ----
-// payouts.local.json が増えたらこのスクリプトを再実行し、ev-scan.mjs の CALIB 定数を更新すること。
-console.log("\n===== ev-scan用 補正係数(暗黙勝率×この倍率が実測ベースの勝率) =====");
-for (const c of winCalib) {
-  const ciTxt = c.ci ? ` CI[${c.ci[0].toFixed(2)}, ${c.ci[1].toFixed(2)}]` : "";
-  console.log(`  ${c.label}: ×${c.factor.toFixed(3)}${ciTxt}`);
+function printBandTable(sub, title, { collectCalib = false } = {}) {
+  const winCalib = [];
+  console.log(`===== 人気帯別の実測回収率(100円均等買い)${title} n=${sub.length}R =====`);
+  console.log("帯        点数    単勝的中  単勝回収率(top1除外)  95%CI          複勝的中  複勝回収率(top1除外)  95%CI");
+  BANDS.forEach((b, bi) => {
+    const tot = { bets: 0, winRet: 0, placeRet: 0, winHits: 0, placeHits: 0 };
+    const winList = [];
+    const placeList = [];
+    for (const r of sub) {
+      const st = r.bandStats[bi];
+      tot.bets += st.bets;
+      tot.winRet += st.winRet;
+      tot.placeRet += st.placeRet;
+      tot.winHits += st.winHits;
+      tot.placeHits += st.placeHits;
+      if (st.winRet > 0) winList.push(st.winRet);
+      if (st.placeRet > 0) placeList.push(st.placeRet);
+    }
+    if (tot.bets === 0) return;
+    const rate = (ret) => ((ret / (tot.bets * 100)) * 100).toFixed(1) + "%";
+    const rateExTop = (ret, list) =>
+      (((ret - (list.length ? Math.max(...list) : 0)) / (tot.bets * 100)) * 100).toFixed(1) + "%";
+    const ciTxt = (ci) => (ci ? `[${(ci[0] * 100).toFixed(1)},${(ci[1] * 100).toFixed(1)}]` : "-");
+    const wci = bootstrapCI(sub, bi, "winRet");
+    const pci = bootstrapCI(sub, bi, "placeRet");
+    // 補正係数 = 実測単勝回収率 ÷ 0.8(控除後の理論回収率)。
+    // 単勝回収率 = 真の勝率×オッズ の期待値、オッズ ≈ 0.8/暗黙勝率 なので、
+    // 回収率/0.8 = 真の勝率/オッズ暗黙勝率(=暗黙勝率に掛けるべき倍率)になる。
+    if (collectCalib)
+      winCalib.push({ label: b.label.trim(), factor: tot.winRet / (tot.bets * 100) / 0.8, ci: wci ? [wci[0] / 0.8, wci[1] / 0.8] : null });
+    console.log(
+      `${b.label}  ${String(tot.bets).padStart(5)}  ${String(tot.winHits).padStart(6)}  ${rate(tot.winRet).padStart(7)} (${rateExTop(tot.winRet, winList).padStart(6)})  ${ciTxt(wci).padStart(13)}  ${String(tot.placeHits).padStart(6)}  ${rate(tot.placeRet).padStart(7)} (${rateExTop(tot.placeRet, placeList).padStart(6)})  ${ciTxt(pci).padStart(13)}`,
+    );
+  });
+  return winCalib;
 }
 
 // ---- プール間の歪み: 帯ごとの(複勝回収率 − 単勝回収率)のペア差ブートストラップ ----
 // 同じレース集合での差なのでペアで比較(レースごとの相関を保ったままリサンプリング)
-if (BOOTSTRAP > 0) {
-  console.log("\n===== プール間の歪み: 複勝回収率 − 単勝回収率(正=複勝の方がマシ) =====");
+// 戻り値: セルごとの {band, obs, lo, hi, p}。pはブートストラップ両側p値
+// (分布の符号割合の2倍、+1補正でp=0を避ける)。--byの多重比較補正で使う。
+function printPoolGap(sub, title) {
+  const cells = [];
+  if (BOOTSTRAP <= 0) return cells;
+  console.log(`\n===== プール間の歪み: 複勝回収率 − 単勝回収率(正=複勝の方がマシ)${title} =====`);
   BANDS.forEach((b, bi) => {
     const rand = mulberry32(1234);
-    const n = perRace.length;
+    const n = sub.length;
     let obsW = 0;
     let obsP = 0;
     let obsBets = 0;
-    for (const r of perRace) {
+    for (const r of sub) {
       obsW += r.bandStats[bi].winRet;
       obsP += r.bandStats[bi].placeRet;
       obsBets += r.bandStats[bi].bets;
@@ -218,7 +226,7 @@ if (BOOTSTRAP > 0) {
       let dp = 0;
       let db = 0;
       for (let i = 0; i < n; i++) {
-        const st = perRace[(rand() * n) | 0].bandStats[bi];
+        const st = sub[(rand() * n) | 0].bandStats[bi];
         dw += st.winRet;
         dp += st.placeRet;
         db += st.bets;
@@ -228,10 +236,94 @@ if (BOOTSTRAP > 0) {
     means.sort((x, y) => x - y);
     const lo = means[Math.floor(0.025 * BOOTSTRAP)];
     const hi = means[Math.min(BOOTSTRAP - 1, Math.floor(0.975 * BOOTSTRAP))];
+    let le = 0;
+    let ge = 0;
+    for (const m of means) {
+      if (m <= 0) le++;
+      if (m >= 0) ge++;
+    }
+    const p = Math.min(1, (2 * (Math.min(le, ge) + 1)) / (BOOTSTRAP + 1));
+    cells.push({ band: b.label.trim(), obs, lo, hi, p, nRaces: sub.length, bets: obsBets });
     console.log(
       `${b.label}  差 ${obs >= 0 ? "+" : ""}${(obs * 100).toFixed(1)}pt  95%CI [${(lo * 100).toFixed(1)}, ${(hi * 100).toFixed(1)}]${lo > 0 ? "  ← 有意に複勝優位" : hi < 0 ? "  ← 有意に単勝優位" : ""}`,
     );
   });
+  return cells;
+}
+
+// ---- 全体 ----
+const winCalib = printBandTable(perRace, "", { collectCalib: true });
+// ev-scan.mjs 用の補正係数(オッズ暗黙勝率に掛ける倍率)。
+// payouts.local.json が増えたらこのスクリプトを再実行し、ev-scan.mjs の CALIB 定数を更新すること。
+console.log("\n===== ev-scan用 補正係数(暗黙勝率×この倍率が実測ベースの勝率) =====");
+for (const c of winCalib) {
+  const ciTxt = c.ci ? ` CI[${c.ci[0].toFixed(2)}, ${c.ci[1].toFixed(2)}]` : "";
+  console.log(`  ${c.label}: ×${c.factor.toFixed(3)}${ciTxt}`);
+}
+printPoolGap(perRace, "");
+
+// ---- --by: 距離/馬場/頭数の分割検証(セルが小さくなるのでCIで判断する) ----
+const SEGMENTS = {
+  dist: [
+    ["短距離(〜1400m)", (m) => m.distance != null && m.distance <= 1400],
+    ["中距離(1401〜2200m)", (m) => m.distance != null && m.distance > 1400 && m.distance <= 2200],
+    ["長距離(2201m〜)", (m) => m.distance != null && m.distance > 2200],
+  ],
+  going: [
+    ["良馬場", (m) => m.going === "良"],
+    ["道悪(稍重/重/不良)", (m) => m.going != null && m.going !== "良"],
+  ],
+  field: [
+    ["少頭数(〜12頭)", (m) => m.fieldSize <= 12],
+    ["多頭数(13頭〜)", (m) => m.fieldSize >= 13],
+  ],
+};
+if (BY) {
+  const keys = BY === "all" ? Object.keys(SEGMENTS) : BY.split(",");
+  const allCells = []; // 多重比較補正の対象(全分割セルの複勝−単勝ペア差)
+  for (const key of keys) {
+    const segs = SEGMENTS[key];
+    if (!segs) {
+      console.error(`--by ${key} は未対応(dist / going / field / all)`);
+      continue;
+    }
+    for (const [name, test] of segs) {
+      const sub = perRace.filter((r) => test(r.meta));
+      if (sub.length === 0) continue;
+      console.log("");
+      printBandTable(sub, ` 【${name}】`);
+      for (const c of printPoolGap(sub, ` 【${name}】`)) allCells.push({ segment: name, ...c });
+    }
+  }
+
+  // ---- 多重比較補正(BH法=FDR 5% と Bonferroni を併記) ----
+  // 分割セルを増やすほど「たまたま有意」が混ざる(m個の独立検定で偽陽性の期待値 ≈ 0.05m)。
+  // 各セルのブートストラップ両側p値に対し、BH: p(i) ≤ (i/m)α を満たす最大順位まで採択。
+  if (allCells.length > 0) {
+    const ALPHA = 0.05;
+    const m = allCells.length;
+    const sorted = [...allCells].sort((a, b) => a.p - b.p);
+    let kMax = 0;
+    sorted.forEach((c, i) => {
+      if (c.p <= ((i + 1) / m) * ALPHA) kMax = i + 1;
+    });
+    console.log(`\n===== 多重比較補正(複勝−単勝ペア差、セル数 m=${m}、α=${ALPHA}) =====`);
+    console.log("順位  セル                                   差       p値      BH閾値   BH(FDR5%)  Bonferroni");
+    sorted.slice(0, Math.max(kMax, 8)).forEach((c, i) => {
+      const bhThr = ((i + 1) / m) * ALPHA;
+      const bh = i < kMax ? "生き残り" : "棄却";
+      const bonf = c.p <= ALPHA / m ? "生き残り" : "棄却";
+      console.log(
+        `${String(i + 1).padStart(3)}  ${`${c.segment}×${c.band}`.padEnd(24, "　")} ${`${c.obs >= 0 ? "+" : ""}${(c.obs * 100).toFixed(1)}pt`.padStart(8)}  ${c.p.toFixed(4)}  ${bhThr.toFixed(4)}  ${bh.padEnd(5, "　")}  ${bonf}`,
+      );
+    });
+    if (kMax === 0) {
+      console.log("→ BH補正(FDR5%)後に生き残るセルなし = 分割の有意セルは多重比較のノイズと整合的");
+    } else {
+      console.log(`→ BH補正後も ${kMax} セルが生き残り(表の上位${kMax}件)。Bonferroni(p≤${(ALPHA / m).toFixed(4)})はより保守的な参考値`);
+    }
+    console.log("※ 同一レースを共有するセル同士は独立でない(BHの前提より保守側に働くとは限らない)点に注意");
+  }
 }
 
 console.log(`

@@ -577,6 +577,7 @@ function evaluate(samples, label) {
     fav: { win: 0, top3: 0, ll: 0, r: mkR() },
   };
   const llPairs = []; // レースごとの [モデルlogloss, 人気ベースラインlogloss](--bootstrap用)
+  const hitPairs = []; // レースごとの [モデル3連単, 人気順3連単, モデル3連複, 人気順3連複] の的中0/1(--bootstrap用)
   for (const s of samples) {
     const race = s.race;
     const target = { distance: race.distance, surface: race.surface };
@@ -640,6 +641,7 @@ function evaluate(samples, label) {
       .map(([, i]) => i);
     const fh = rankHits(favOrder, s.entrants);
     for (const k of Object.keys(fh)) if (fh[k]) st.fav.r[k]++;
+    hitPairs.push([mh.sanrentan ? 1 : 0, fh.sanrentan ? 1 : 0, mh.sanrenpuku ? 1 : 0, fh.sanrenpuku ? 1 : 0]);
   }
   const pc = (x) => ((x / Math.max(st.n, 1)) * 100).toFixed(1) + "%";
   console.log(`\n===== 検証: ${label} (${st.n}レース) =====`);
@@ -658,7 +660,10 @@ function evaluate(samples, label) {
   console.log(rline("ロジ回帰      ", st.model.r));
   console.log(rline("v2(手動重み)  ", st.v2.r));
   console.log(rline("人気順        ", st.fav.r));
-  if (BOOTSTRAP > 0) bootstrapReport(llPairs, label);
+  if (BOOTSTRAP > 0) {
+    bootstrapReport(llPairs, label);
+    bootstrapHitReport(hitPairs, label);
+  }
 }
 
 // ---- ブートストラップ(--bootstrap N) ----
@@ -700,6 +705,38 @@ function bootstrapReport(llPairs, label) {
       ? `→ 市場超えは統計的に有意(95%CIが0未満)`
       : `→ 95%CIが0を跨ぐ: この標本サイズでは「市場超え」と「誤差」を区別できない`,
   );
+}
+
+// ---- 3連系ヒット率の差のブートストラップ(--bootstrap時にloglossと併せて出力) ----
+// レースごとの的中0/1のペア差 d_i = モデル的中 − 人気順的中(-1/0/+1)をリサンプリング。
+// 的中イベント自体が数十件しかないので、点推定の差(例: 3.0% vs 2.7%)がノイズか判定するのが目的。
+function bootstrapHitReport(hitPairs, label) {
+  const n = hitPairs.length;
+  if (n === 0) return;
+  console.log(`--- ブートストラップ: 3連系ヒット率の差(モデル−人気順、正=モデル優位) n=${n}R B=${BOOTSTRAP} ---`);
+  for (const [name, mi, fi] of [
+    ["3連単", 0, 1],
+    ["3連複", 2, 3],
+  ]) {
+    const diffs = hitPairs.map((p) => p[mi] - p[fi]);
+    const mHits = hitPairs.reduce((a, p) => a + p[mi], 0);
+    const fHits = hitPairs.reduce((a, p) => a + p[fi], 0);
+    const obs = (mHits - fHits) / n;
+    const rand = mulberry32(42);
+    const means = new Array(BOOTSTRAP);
+    for (let b = 0; b < BOOTSTRAP; b++) {
+      let sum = 0;
+      for (let i = 0; i < n; i++) sum += diffs[(rand() * n) | 0];
+      means[b] = sum / n;
+    }
+    means.sort((a, b) => a - b);
+    const lo = means[Math.floor(0.025 * BOOTSTRAP)];
+    const hi = means[Math.min(BOOTSTRAP - 1, Math.floor(0.975 * BOOTSTRAP))];
+    const pNotBetter = means.filter((m) => m <= 0).length / BOOTSTRAP;
+    console.log(
+      `${name}: モデル${mHits}件(${((mHits / n) * 100).toFixed(1)}%) vs 人気順${fHits}件(${((fHits / n) * 100).toFixed(1)}%)  差 ${obs >= 0 ? "+" : ""}${(obs * 100).toFixed(2)}pt  95%CI [${(lo * 100).toFixed(2)}, ${(hi * 100).toFixed(2)}]  P(差<=0) ${(pNotBetter * 100).toFixed(1)}%${lo > 0 ? "  ← 有意にモデル優位" : hi < 0 ? "  ← 有意に人気順優位" : "  ← CIが0を跨ぐ=誤差と区別できない"}`,
+    );
+  }
 }
 
 evaluate(testRaces, `全クラス ${TEST_FROM}以降`);

@@ -13,9 +13,16 @@
 //   3連複20点: 上位6頭(◎○▲△△☆)ボックス C(6,3)=20
 //   3連単60点: ◎軸1頭マルチ・相手○▲△△☆(5頭) C(5,2)×3!=60
 //
-// 使い方: node scripts/bets-backtest.mjs [--since YYYY-MM-DD] [--verbose] [--dist]
-//   --dist: 券種ごとに「上位1件の的中を除いた回収率」も併記する。
+// 使い方: node scripts/bets-backtest.mjs [--since YYYY-MM-DD] [--verbose] [--dist [N]] [--all-races]
+//   --dist [N]: 券種ごとに「払戻上位N件の的中を除いた回収率」も併記する(N省略時は1)。
+//   あわせて上位1件が払戻総額に占める割合(%)も表示する。
 //   (memory: keiba-app-payout-concentration — 超大穴1件が合計回収率を吊り上げる罠の確認用)
+//   --all-races: 母集団を「平地重賞のみ」(既定)から「平地全レース」に広げる。
+//   payouts.local.json に条件戦の払戻が入っている分だけ対象が増える。
+//   注意: payouts.local.json はクロールで増え続けるため、結果を引用するときは必ずレース数nを添えること。
+//   --by-class: 階級別(新馬・未勝利 / 1〜3勝クラス / OP・重賞 / 級不明)の内訳を全体の後に表示。
+//   全レース回収率の崩壊が「履歴の薄い新馬・未勝利に集中」か「条件戦全体に広がる」かの切り分け用。
+//   --all-races を含意する(母集団は平地全レース)。
 
 import { createClient } from "@supabase/supabase-js";
 import fs from "node:fs";
@@ -26,7 +33,12 @@ const args = process.argv.slice(2);
 const sinceIdx = args.indexOf("--since");
 const SINCE = sinceIdx >= 0 ? args[sinceIdx + 1] : null;
 const VERBOSE = args.includes("--verbose");
-const DIST = args.includes("--dist");
+const distIdx = args.indexOf("--dist");
+const DIST = distIdx >= 0;
+// --dist の直後が数値ならそれを除外件数Nとして使う(例: --dist 5)。省略時は従来どおり1件。
+const DIST_N = DIST && /^\d+$/.test(args[distIdx + 1] ?? "") ? Number(args[distIdx + 1]) : 1;
+const BY_CLASS = args.includes("--by-class");
+const ALL_RACES = args.includes("--all-races") || BY_CLASS;
 
 try {
   process.loadEnvFile(".env");
@@ -51,6 +63,18 @@ function classWeight(grade, raceName) {
   if (/[3３]勝クラス/.test(n)) return 0.8;
   if (/オープン/.test(n)) return 0.9;
   return 0.7;
+}
+// 階級レイヤ判定(--by-class用)。classWeightと同じレース名パターンでグルーピング。
+// grade付き(G1〜G3・L等)とレース名「オープン」はOP・重賞層。どれにも該当しない
+// 平場レース(名前に級表記がない特別戦など、classWeightが既定0.7を返す層)は「級不明」で別掲。
+const CLASS_LAYERS = ["新馬・未勝利", "1〜3勝クラス", "OP・重賞", "級不明(特別戦等)"];
+function raceClassLayer(grade, raceName) {
+  if (grade) return "OP・重賞";
+  const n = String(raceName ?? "");
+  if (/新馬|未勝利|メイクデビュー/.test(n)) return "新馬・未勝利";
+  if (/[1１2２3３]勝クラス/.test(n)) return "1〜3勝クラス";
+  if (/オープン/.test(n)) return "OP・重賞";
+  return "級不明(特別戦等)";
 }
 // 障害判定(4E・predict.ts と同期)。平場障害は grade=null なので名前/コースでも見る。
 const isJumpRun = (grade, raceName, surface) =>
@@ -170,13 +194,25 @@ const BET_TYPES = [
   "3連複20点(300円×20)",
   "3連単60点(100円×60)",
 ];
-const agg = Object.fromEntries(BET_TYPES.map((t) => [t, { cost: 0, ret: 0, hit: 0, races: 0, hits: [] }]));
-// 参考: 1番人気ベースライン
-const fav = { tan: { cost: 0, ret: 0, hit: 0, races: 0 }, fuku: { cost: 0, ret: 0, hit: 0, races: 0 } };
+const makeAgg = () => ({
+  agg: Object.fromEntries(BET_TYPES.map((t) => [t, { cost: 0, ret: 0, hit: 0, races: 0, hits: [] }])),
+  fav: { tan: { cost: 0, ret: 0, hit: 0, races: 0 }, fuku: { cost: 0, ret: 0, hit: 0, races: 0 } },
+  nRaces: 0,
+});
+const total = makeAgg();
+const { agg, fav } = total; // 既存コードの参照名を維持
+// --by-class: 階級レイヤ別に同じ集計を積む
+const byClass = BY_CLASS ? new Map(CLASS_LAYERS.map((c) => [c, makeAgg()])) : null;
 
 let nRaces = 0;
+// 既定は従来どおり平地重賞のみ(後方互換)。--all-races で平地全レース(条件戦含む)に拡大。
 const targets = races.filter(
-  (r) => r.grade && !r.grade.startsWith("J") && payoutStore[r.id] && (!SINCE || r.date >= SINCE),
+  (r) =>
+    (ALL_RACES
+      ? !isJumpRun(r.grade, r.name, r.surface)
+      : r.grade && !r.grade.startsWith("J")) &&
+    payoutStore[r.id] &&
+    (!SINCE || r.date >= SINCE),
 );
 
 for (const race of targets) {
@@ -213,6 +249,10 @@ for (const race of targets) {
   const top6 = scored.slice(0, 6); // ◎○▲△△☆(3連複BOX用)
   const multi5 = scored.slice(1, 6); // ○▲△△☆(3連単◎軸マルチの相手)
   nRaces++;
+  total.nRaces++;
+  const clsAgg = BY_CLASS ? byClass.get(raceClassLayer(race.grade, race.name)) : null;
+  if (clsAgg) clsAgg.nRaces++;
+  const sinks = clsAgg ? [total, clsAgg] : [total];
 
   const bets = []; // [type, cost, return]
   // 複勝・単勝
@@ -283,52 +323,76 @@ for (const race of targets) {
     bets.push(["3連単60点(100円×60)", cost, ret]);
   }
 
-  for (const [type, cost, ret] of bets) {
-    agg[type].cost += cost;
-    agg[type].ret += ret;
-    agg[type].races++;
-    if (ret > 0) {
-      agg[type].hit++;
-      agg[type].hits.push({ date: race.date, name: race.name, ret });
+  for (const sink of sinks) {
+    for (const [type, cost, ret] of bets) {
+      sink.agg[type].cost += cost;
+      sink.agg[type].ret += ret;
+      sink.agg[type].races++;
+      if (ret > 0) {
+        sink.agg[type].hit++;
+        sink.agg[type].hits.push({ date: race.date, name: race.name, ret });
+      }
     }
   }
 
-  // 1番人気ベースライン(単勝/複勝 各6000円)
+  // 1番人気ベースライン(単勝/複勝 各6000円)。--by-class時は同じ層内で比較できるよう層別にも積む
   const favH = entrants.find((h) => h.popularity === 1);
   if (favH) {
-    fav.tan.cost += 6000;
-    fav.tan.ret += (lookup(P.win, String(favH.umaban)) * 6000) / 100;
-    fav.tan.races++;
-    if (lookup(P.win, String(favH.umaban)) > 0) fav.tan.hit++;
-    fav.fuku.cost += 6000;
-    fav.fuku.ret += (lookup(P.place, String(favH.umaban)) * 6000) / 100;
-    fav.fuku.races++;
-    if (lookup(P.place, String(favH.umaban)) > 0) fav.fuku.hit++;
+    const tanYen = lookup(P.win, String(favH.umaban));
+    const fukuYen = lookup(P.place, String(favH.umaban));
+    for (const sink of sinks) {
+      sink.fav.tan.cost += 6000;
+      sink.fav.tan.ret += (tanYen * 6000) / 100;
+      sink.fav.tan.races++;
+      if (tanYen > 0) sink.fav.tan.hit++;
+      sink.fav.fuku.cost += 6000;
+      sink.fav.fuku.ret += (fukuYen * 6000) / 100;
+      sink.fav.fuku.races++;
+      if (fukuYen > 0) sink.fav.fuku.hit++;
+    }
   }
 
   if (VERBOSE) {
     const hit = bets.filter(([, , r]) => r > 0).map(([t]) => t.split("(")[0]);
     console.log(
-      `${race.date} ${race.name}(${race.grade}) ◎${hon.name}=${hon.place ?? "?"}着 → 的中: ${hit.join(",") || "なし"}`,
+      `${race.date} ${race.name}(${race.grade ?? "平場"}) ◎${hon.name}=${hon.place ?? "?"}着 → 的中: ${hit.join(",") || "なし"}`,
     );
   }
 }
 
 const fmt = (s) =>
   `的中率 ${((s.hit / Math.max(s.races, 1)) * 100).toFixed(1).padStart(5)}% / 回収率 ${((s.ret / Math.max(s.cost, 1)) * 100).toFixed(1).padStart(6)}% / 投資 ${s.cost.toLocaleString()}円 → 払戻 ${Math.round(s.ret).toLocaleString()}円`;
-console.log(`\n===== 券種別シミュレーション(平地重賞 ${nRaces}レース・各券種6,000円/レース) =====`);
-for (const t of BET_TYPES) {
-  console.log(`${t.padEnd(16, "　")} ${fmt(agg[t])}`);
-  if (DIST && agg[t].hits.length > 0) {
-    const top = [...agg[t].hits].sort((a, b) => b.ret - a.ret)[0];
-    const restCost = agg[t].cost; // 除外しても投資額は不変(全レース分買っているため)
-    const restRet = agg[t].ret - top.ret;
-    console.log(
-      `  └ 上位1件除く: 回収率 ${((restRet / Math.max(restCost, 1)) * 100).toFixed(1)}%  ` +
-        `(除外: ${top.date} ${top.name} 払戻${Math.round(top.ret).toLocaleString()}円)`,
-    );
+function printReport(label, sink) {
+  console.log(`\n===== 券種別シミュレーション(${label} ${sink.nRaces}レース・各券種6,000円/レース) =====`);
+  for (const t of BET_TYPES) {
+    const a = sink.agg[t];
+    console.log(`${t.padEnd(16, "　")} ${fmt(a)}`);
+    if (DIST && a.hits.length > 0) {
+      const sorted = [...a.hits].sort((x, y) => y.ret - x.ret);
+      const n = Math.min(DIST_N, sorted.length);
+      const exclRet = sorted.slice(0, n).reduce((s, h) => s + h.ret, 0);
+      const restCost = a.cost; // 除外しても投資額は不変(全レース分買っているため)
+      const restRet = a.ret - exclRet;
+      const top = sorted[0];
+      // 上位1件シェア: 母集団が広がると的中件数が増え「1件の重み」自体が変わるので毎回明示する
+      const top1Share = (top.ret / Math.max(a.ret, 1)) * 100;
+      console.log(
+        `  └ 上位${n}件除く: 回収率 ${((restRet / Math.max(restCost, 1)) * 100).toFixed(1)}%  ` +
+          `(上位1件シェア ${top1Share.toFixed(1)}% = ${top.date} ${top.name} 払戻${Math.round(top.ret).toLocaleString()}円)`,
+      );
+    }
+  }
+  console.log("---- 参考(市場ベースライン・同じ母集団) ----");
+  console.log(`1番人気 単勝6000円　 ${fmt(sink.fav.tan)}`);
+  console.log(`1番人気 複勝6000円　 ${fmt(sink.fav.fuku)}`);
+}
+
+const scopeLabel = ALL_RACES ? "平地全レース" : "平地重賞";
+printReport(scopeLabel, total);
+if (BY_CLASS) {
+  for (const cls of CLASS_LAYERS) {
+    const sink = byClass.get(cls);
+    if (sink.nRaces === 0) continue;
+    printReport(`階級別: ${cls}`, sink);
   }
 }
-console.log("---- 参考(市場ベースライン) ----");
-console.log(`1番人気 単勝6000円　 ${fmt(fav.tan)}`);
-console.log(`1番人気 複勝6000円　 ${fmt(fav.fuku)}`);
