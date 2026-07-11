@@ -4,6 +4,7 @@ import { useState } from "react";
 import type { RaceResult, RaceCard, Grade, EntryHorse } from "@/lib/racing-data";
 import { WAKU_COLORS } from "@/lib/racing-data";
 import type { RacePrediction } from "@/lib/predict";
+import { buildBetSuggestion } from "@/lib/bet-suggest";
 import { GradeBadge, Umaban } from "@/components/racing-bits";
 
 export interface ScheduleDay {
@@ -312,6 +313,49 @@ function EntriesSection({ raceCards }: { raceCards: RaceCard[] }) {
   );
 }
 
+// 買い目メモ(bet-suggest.ts)の表示ブロック。stanceで色分けする。
+function BetSuggestionBlock({ p }: { p: RacePrediction }) {
+  const s = buildBetSuggestion(p);
+  const stanceColor =
+    s.stance === "buy" ? "var(--turf)" : s.stance === "small" ? "var(--gold)" : "var(--ink-soft)";
+  return (
+    <div className="border-t px-4 py-3" style={{ borderColor: "var(--paper-dark)" }}>
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <span
+          className="rounded px-1.5 py-0.5 font-bold text-white"
+          style={{ background: stanceColor }}
+        >
+          {s.layer}
+        </span>
+        <span className="font-bold" style={{ color: stanceColor }}>
+          {s.stanceLabel}
+        </span>
+      </div>
+      <div className="mt-1.5 text-sm font-bold">{s.headline}</div>
+      {s.points.length > 0 && (
+        <ul className="mt-1 space-y-0.5 text-xs" style={{ color: "var(--ink-soft)" }}>
+          {s.points.map((pt) => (
+            <li key={pt}>・{pt}</li>
+          ))}
+        </ul>
+      )}
+      {s.bets.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-2">
+          {s.bets.map((b) => (
+            <span
+              key={b.label}
+              className="rounded border px-2 py-1 text-xs font-bold"
+              style={{ borderColor: stanceColor, color: "var(--ink)" }}
+            >
+              {b.label} <span style={{ color: stanceColor }}>{b.amount}</span>
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PredictionCard({ p }: { p: RacePrediction }) {
   return (
     <div
@@ -381,11 +425,13 @@ function PredictionCard({ p }: { p: RacePrediction }) {
           ))}
         </tbody>
       </table>
+      <BetSuggestionBlock p={p} />
       <div
         className="px-4 py-2 text-xs"
         style={{ background: "var(--paper-dark)", color: "var(--ink-soft)" }}
       >
-        スコア = 重賞実績 + 近走の調子(直近4走・コース適性)+ 騎手の重賞複勝率 + 斤量差
+        スコア = 重賞実績 + 近走の調子(直近4走・コース適性)+ 騎手の重賞複勝率 + 斤量差 /
+        買い目メモは実測バックテスト(回収率)に基づく参考情報で、全券種の平均回収率は100%未満です
       </div>
     </div>
   );
