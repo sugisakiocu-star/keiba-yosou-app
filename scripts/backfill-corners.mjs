@@ -1,16 +1,24 @@
 // DBに保存済みの結果ページcname(race_results.cname)を再取得し、各馬のコーナー通過順位を
 // 抽出して scripts/corners.local.json に保存するローカルバッチ。脚質(逃げ/先行/差し/追込)特徴量の材料。
-// 同じ結果ページから追加リクエストゼロで払戻金(scripts/payouts.local.json)と単複オッズページの
-// cname(scripts/odds-cnames.local.json、将来の歴史的オッズバックフィル用)も一緒に拾う。
-// 公開リポジトリにJRA由来データを再配布しないため、出力はコミットしない(.gitignore)。
+// 同じ結果ページから追加リクエストゼロで払戻金(scripts/payouts.local.json・平地全レース対象)と
+// 単複オッズページのcname(scripts/odds-cnames.local.json、将来の歴史的オッズバックフィル用)も
+// 一緒に拾う。公開リポジトリにJRA由来データを再配布しないため、出力はコミットしない(.gitignore)。
 //
 // 使い方(プロジェクト直下で):
 //   node scripts/backfill-corners.mjs --dry --limit 3     … 先頭3件を取得して内容表示(保存もする)
 //   node scripts/backfill-corners.mjs --skip-existing     … 全件(未取得のみ)。約8,800件×1.5秒≒3.7時間
 //   node scripts/backfill-corners.mjs --since 2025-01-01 --until 2025-12-31 --skip-existing
+//   node scripts/backfill-corners.mjs --refill-payouts --dry --limit 3   … 補完モード(下記参照)
 //
 // 取得ルール(プロジェクト方針準拠): JRA公式のみ・UA明示・1.5秒間隔・キャッシュ済みは再取得しない。
 // 途中で止めても --skip-existing で再開できる(50件ごとに追記保存)。スキップ判定はcorners基準のまま。
+//
+// ⚠️ --refill-payoutsモード: 払戻・オッズcnameの取得は通常モードだと「コーナーが未取得の行」でしか
+// トリガーされない(スキップ判定がcorners.local.json基準の一括ゲートのため)。2026-07-11に払戻の
+// 対象を重賞のみ→平地全レースに広げたが、それ以前に既にコーナー取得済みだったレースは条件戦の
+// 払戻・オッズcnameを持っていない。--refill-payoutsは「コーナー取得済みだが払戻orオッズcnameが
+// 欠けているレース」だけを対象に結果ページを再取得し、コーナーには触れず払戻・オッズcnameだけを
+// 埋める(2026-07-11時点で対象約5,438件・見積り約2.3時間)。
 
 import { createClient } from "@supabase/supabase-js";
 import fs from "node:fs";
@@ -34,6 +42,7 @@ const LIMIT = Number(argOf("--limit", "Infinity"));
 const SKIP_EXISTING = args.includes("--skip-existing");
 const SINCE = argOf("--since", null);
 const UNTIL = argOf("--until", null);
+const REFILL_PAYOUTS = args.includes("--refill-payouts");
 
 try {
   process.loadEnvFile(".env");
@@ -96,6 +105,11 @@ function parseOddsCname(html) {
   return m ? m[1] : null;
 }
 
+// 障害レース判定(predict.ts/backtest.mjs/bets-backtest.mjsと同じ定義・変更時は要同期)。
+// 平場障害はgrade=nullでJフィルタをすり抜けるためsurface/レース名でも見る。
+const isJumpRun = (grade, raceName, surface) =>
+  String(grade ?? "").startsWith("J") || surface === "障" || /障害/.test(String(raceName ?? ""));
+
 // ---- 対象レースをDBから取得 ----
 console.log(`■ コーナー通過順バックフィル  since=${SINCE ?? "-"} until=${UNTIL ?? "-"} skipExisting=${SKIP_EXISTING} limit=${LIMIT}`);
 let store = {};
@@ -121,7 +135,7 @@ const races = [];
 for (let from = 0; ; from += 1000) {
   let q = supabase
     .from("race_results")
-    .select("id,date,track,race_no,name,grade,cname")
+    .select("id,date,track,race_no,name,grade,surface,cname")
     .order("date", { ascending: false })
     .order("id", { ascending: true })
     .range(from, from + 999);
@@ -147,6 +161,53 @@ const save = () => {
 
 for (const r of races) {
   if (done + failed >= LIMIT) break;
+
+  if (REFILL_PAYOUTS) {
+    // 補完モード: コーナー未取得のレースはここでは扱わない(通常モードの担当)
+    if (!store[r.id]) {
+      skipped++;
+      continue;
+    }
+    const needsPayout = !isJumpRun(r.grade, r.name, r.surface) && !payoutStore[r.id];
+    const needsOddsCname = !oddsCnameStore[r.id];
+    if (!needsPayout && !needsOddsCname) {
+      skipped++;
+      continue;
+    }
+    try {
+      const html = await getResultHtml(r.cname);
+      reqCount++;
+      if (needsPayout) {
+        const payouts = parsePayouts(html);
+        if (payouts?.win?.length) {
+          payoutStore[r.id] = { date: r.date, track: r.track, name: r.name, grade: r.grade, payouts };
+          payoutsAdded++;
+        }
+      }
+      if (needsOddsCname) {
+        const oddsCname = parseOddsCname(html);
+        if (oddsCname) {
+          oddsCnameStore[r.id] = oddsCname;
+          oddsCnamesAdded++;
+        }
+      }
+      done++;
+      if (DRY)
+        console.log(
+          `  ○ ${r.date} ${r.track}${r.race_no}R ${r.name}: 払戻=${needsPayout ? (payoutStore[r.id] ? "取得" : "△") : "既存"} オッズcname=${needsOddsCname ? (oddsCnameStore[r.id] ? "取得" : "△") : "既存"}`,
+        );
+      if (done % SAVE_EVERY === 0) save();
+      if (done % 200 === 0 && done > 0 && !DRY)
+        console.log(`  … ${done}件取得(スキップ${skipped}・失敗${failed})  ${r.date}まで到達`);
+      await sleep(DELAY_MS);
+    } catch (e) {
+      failed++;
+      console.warn(`  ✗ ${r.date} ${r.track}${r.race_no}R: ${e.message}`);
+      await sleep(DELAY_MS * 2);
+    }
+    continue;
+  }
+
   if (SKIP_EXISTING && store[r.id]) {
     skipped++;
     continue;
@@ -163,8 +224,8 @@ for (const r of races) {
       done++;
       if (DRY) console.log(`  ○ ${r.date} ${r.track}${r.race_no}R ${r.name}:`, JSON.stringify(corners));
     }
-    // 同じHTMLから追加リクエストゼロで払戻金とオッズcnameも拾う(重賞のみ・払戻は既存分をスキップ)
-    if (r.grade && !r.grade.startsWith("J") && !payoutStore[r.id]) {
+    // 同じHTMLから追加リクエストゼロで払戻金とオッズcnameも拾う(平地全レース対象・払戻は既存分をスキップ)
+    if (!isJumpRun(r.grade, r.name, r.surface) && !payoutStore[r.id]) {
       const payouts = parsePayouts(html);
       if (payouts?.win?.length) {
         payoutStore[r.id] = { date: r.date, track: r.track, name: r.name, grade: r.grade, payouts };

@@ -10,12 +10,13 @@
 //       3連単ページは1レースあたり数百KB〜1MB近くと重いので、対象を絞って使うこと)
 //   node scripts/fetch-odds.mjs --date 2026-07-11 --track 福島 --dry   … クロール連鎖の確認のみ(保存なし)
 //
-// ⚠️ 制約(2026-07-10偵察・memory keiba-app-phase4b-odds-recon):
-//   - オッズは開催当日朝10時発売開始。発売前は accessO 開催選択が「今週のオッズは未発表です。」
-//     のみのデッドエンドになる(このスクリプトはその場合明確にエラー終了する)。
+// ⚠️ 制約(2026-07-10偵察→同日夜・実地試験で更新。memory keiba-app-phase4b-odds-recon):
+//   - オッズは前日夜から発売中(2026-07-10金曜20時台に翌土曜3場分の取得成功を実地確認済み。
+//     「当日朝10時発売」という当初の認識は誤り)。それより前(週中)は accessO 開催選択が
+//     「今週のオッズは未発表です。」のみのデッドエンドになる(その場合は明確にエラー終了する)。
 //   - cname のチェックサムはサーバー計算のため自前生成不可。必ずページ上のリンクから拾う。
-//   - 発売中オッズページの実物は未確認(最終オッズでのみパース検証済み)。構造が想定と違う場合は
-//     scratchpad にHTMLを保存して終了するので、それを見てパーサーを直すこと。
+//   - 発売中・最終オッズともページ構造は同一(実地検証済み)。構造が想定と違う場合は
+//     DEBUG_DIR にHTMLを保存して終了するので、それを見てパーサーを直すこと。
 //
 // 設計方針(プロジェクトの取得ルール準拠): JRA公式のみ・UA明示・1.5秒間隔・リクエスト上限つき。
 
@@ -41,10 +42,6 @@ const LABEL = argOf("--label", "snapshot");
 const BETS = argOf("--bets", "tanpuku,wide,umaren").split(",");
 const DRY = args.includes("--dry");
 const MAX_REQ = Number(argOf("--max-requests", "60"));
-if (!DATE || !TRACK) {
-  console.error("使い方: node scripts/fetch-odds.mjs --date YYYY-MM-DD --track 福島 [--label morning] [--bets tanpuku,wide,umaren] [--dry]");
-  process.exit(1);
-}
 
 // ---- 小物(backfill-all-results.mjs と同じ流儀) ----
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -97,7 +94,7 @@ function saveDebug(name, html) {
 }
 
 // accessO 系リンク(doAction('/JRADB/accessO.html','CNAME'))を [{cname, text}] で列挙
-function parseOLinks(html) {
+export function parseOLinks(html) {
   const out = [];
   const re = /<a[^>]*doAction\('\/JRADB\/accessO\.html'\s*,\s*'([^']+)'\)[^>]*>([\s\S]*?)<\/a>/g;
   for (const m of html.matchAll(re)) out.push({ cname: m[1], text: stripTags(m[2]) });
@@ -106,7 +103,7 @@ function parseOLinks(html) {
 
 // ---- パーサー ----
 // 単勝・複勝ページ(table.tanpuku)。返り値: { raceName, horses: {umaban: {name, tan, fukuMin, fukuMax}}, betCnames }
-function parseTanpuku(html) {
+export function parseTanpuku(html) {
   const raceName = stripTags((html.match(/<title>([\s\S]*?)<\/title>/) ?? [])[1] ?? "");
   const horses = {};
   const tbl = (html.match(/<table[^>]*class="[^"]*tanpuku[^"]*"[\s\S]*?<\/table>/) ?? [])[0];
@@ -139,7 +136,7 @@ function parseTanpuku(html) {
 }
 
 // 組み合わせ表(ワイド=範囲、馬連=単一値)。返り値: { "1-2": [min,max]|odds }
-function parseCombi(html, kind) {
+export function parseCombi(html, kind) {
   const out = {};
   const blocks = html.match(/<caption>[\s\S]*?<\/caption>[\s\S]*?<\/tbody>/g) ?? [];
   for (const block of blocks) {
@@ -165,7 +162,7 @@ function parseCombi(html, kind) {
 
 // 3連複表(table.fuku3)。<caption>1-2</caption> の下に3頭目(th)×オッズ(td)が並ぶ。
 // 返り値: { "1-2-3": odds }(キーは3頭を昇順ソートして結合)
-function parseTrio(html) {
+export function parseTrio(html) {
   const out = {};
   const blocks = html.match(/<caption>[\s\S]*?<\/caption>[\s\S]*?<\/tbody>/g) ?? [];
   for (const block of blocks) {
@@ -187,7 +184,7 @@ function parseTrio(html) {
 
 // 3連単表(div.tan3_unit)。1着(h4見出し) > li(2着ごと) > table(3着ごとの単一オッズ)の3階層。
 // 返り値: { "1-2-3": odds }(キーは着順どおり=順序を保持、ソートしない)
-function parseTierce(html) {
+export function parseTierce(html) {
   const out = {};
   const units = html.split('<div class="tan3_unit').slice(1);
   for (const rawUnit of units) {
@@ -217,6 +214,13 @@ function parseTierce(html) {
 }
 
 // ---- クロール連鎖 ----
+// import.meta.url で「直接実行された時だけ」動くようにガードする(fetch-payouts.mjsと同じパターン)。
+// これが無いと、他スクリプトからパーサーだけを import した際にもクロール一式が実行されてしまう。
+async function main() {
+  if (!DATE || !TRACK) {
+    console.error("使い方: node scripts/fetch-odds.mjs --date YYYY-MM-DD --track 福島 [--label morning] [--bets tanpuku,wide,umaren] [--dry]");
+    process.exit(1);
+  }
 console.log(`■ オッズ取得  ${DATE} ${TRACK}  label=${LABEL}  bets=${BETS.join(",")}  DRY=${DRY}`);
 const [, mm, dd] = DATE.match(/^\d{4}-(\d{2})-(\d{2})$/) ?? [];
 if (!mm) {
@@ -228,7 +232,7 @@ const dateLabelA = `${Number(mm)}月${Number(dd)}日`; // 例: 7月11日
 // ① オッズ入口 → 開催選択
 const indexHtml = await postO(ODDS_INDEX_CNAME);
 if (/今週のオッズは未発表です/.test(indexHtml)) {
-  console.error("✗ オッズ未発表(発売は開催当日朝10時〜)。時間を改めて実行すること。");
+  console.error("✗ オッズ未発表(通常は前日夜から発売中。週中はデータなし)。時間を改めて実行すること。");
   process.exit(2);
 }
 const dayLinks = parseOLinks(indexHtml);
@@ -332,3 +336,8 @@ fs.writeFileSync(OUT_PATH, JSON.stringify(store, null, 1));
 console.log(
   `\n完了: ${snapshot.races.length}レース保存 → ${OUT_PATH}(累計スナップショット${store.snapshots.length}件)  総リクエスト ${reqCount}`,
 );
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  await main();
+}

@@ -44,3 +44,4 @@ scripts/payouts.local.json
 scripts/odds.local.json
 scripts/corners.local.json
 scripts/odds-cnames.local.json
+scripts/odds-hist.local.json
