@@ -363,6 +363,51 @@ export async function fetchRaceCard(target: {
 
 export type GradedCard = { race: RaceCard; horses: Horse[] };
 
+// 指定した開催日・競馬場の「全レース」出馬表を取得する(条件戦込みの一括手動取得用)。
+// fetchUpcomingGradedCards と違い重賞フィルタをかけず、レース間に delayMs 空ける
+// (1日分まとめて12レース程度叩くため、周期的なcronより明示的なマナーが必要)。
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export async function fetchAllRacesForDay(
+  date: string,
+  track: string,
+  opts?: { delayMs?: number },
+): Promise<{ cards: GradedCard[]; debug: { dayFound: boolean; raceLinks: number } }> {
+  const delayMs = opts?.delayMs ?? 1500;
+  const indexCname = await fetchIndexCname();
+  const indexHtml = await postJradb(indexCname);
+  const day = parseDayLinks(indexHtml).find(
+    (d) => d.date === date && (d.track === null || d.track.includes(track)),
+  );
+  if (!day) return { cards: [], debug: { dayFound: false, raceLinks: 0 } };
+
+  const dayHtml = await postJradb(day.cname);
+  const raceLinks = parseRaceLinks(dayHtml);
+
+  const cards: GradedCard[] = [];
+  for (const race of raceLinks) {
+    await sleep(delayMs);
+    const shutubaHtml = await postJradb(race.cname);
+    const horses = parseHorses(shutubaHtml);
+    if (horses.length === 0) continue; // 未公開などで空なら書き込まない
+    const course = parseCourse(shutubaHtml);
+    cards.push({
+      race: {
+        date,
+        track,
+        raceNo: race.raceNo,
+        name: race.name ?? "",
+        grade: race.grade,
+        distance: course.distance,
+        surface: course.surface,
+        cname: race.cname,
+      },
+      horses,
+    });
+  }
+  return { cards, debug: { dayFound: true, raceLinks: raceLinks.length } };
+}
+
 // 出馬表インデックスに出ている「今後の重賞」を全て自動収集する(週次cron用)。
 // 各開催日ページはレース一覧をグレード付きで返すので、重賞(grade!=null)だけ出馬表テーブルを取りに行く。
 // リクエスト数は有界: index(1) + 開催日ページ(数日) + 重賞の出馬表(数レース)。

@@ -81,6 +81,28 @@ async function fetchAllRows<T>(
     if ((data?.length ?? 0) < PAGE_SIZE) return out;
   }
 }
+
+// in句の対象が多い(1レースあたり十数頭×多レース)と .in() のURLが長くなりすぎて
+// PostgRESTが400を返すことがある(黙って空扱いになりがちなので要注意)。
+// 名前リストをチャンク分割してから fetchAllRows でページングする。
+const IN_CHUNK = 50;
+function chunk<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+async function fetchAllRowsChunked<T>(
+  keys: string[],
+  makeQuery: (keysChunk: string[], from: number, to: number) => PromiseLike<{ data: T[] | null; error: unknown }>,
+): Promise<T[] | null> {
+  const out: T[] = [];
+  for (const keysChunk of chunk(keys, IN_CHUNK)) {
+    const rows = await fetchAllRows((from, to) => makeQuery(keysChunk, from, to));
+    if (rows == null) return null;
+    out.push(...rows);
+  }
+  return out;
+}
 const GRADE_W: Record<string, number> = { G1: 1.5, G2: 1.2, G3: 1.0 };
 
 // クラス重み(フェーズ4E)。重賞は grade、OP/リステッド/条件戦(grade=null)はレース名の
@@ -201,21 +223,23 @@ export async function buildPredictions(cards: RaceCard[]): Promise<RacePredictio
   let jhist: JockeyRow[] = [];
   try {
     const supabase = createClient(url, anonKey);
-    // id 順 + range() でページングしないと max-rows(1000行)で切られる
+    // id 順 + range() でページングしないと max-rows(1000行)で切られる。
+    // allNames/allJockeys もチャンク分割必須: 多レース分をまとめて予想すると .in() のURLが
+    // 長くなりすぎてPostgRESTが400を返すことがある(黙って空予想になっていたバグ・2026-07-11発見)。
     const [h, j] = await Promise.all([
-      fetchAllRows((from, to) =>
+      fetchAllRowsChunked(allNames, (namesChunk, from, to) =>
         supabase
           .from("result_horses")
           .select("name, place, race_results(date, name, grade, surface, distance)")
-          .in("name", allNames)
+          .in("name", namesChunk)
           .order("id")
           .range(from, to),
       ),
-      fetchAllRows<JockeyRow>((from, to) =>
+      fetchAllRowsChunked<JockeyRow>(allJockeys, (jockeysChunk, from, to) =>
         supabase
           .from("result_horses")
           .select("jockey, place")
-          .in("jockey", allJockeys)
+          .in("jockey", jockeysChunk)
           .order("id")
           .range(from, to),
       ),
